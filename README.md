@@ -24,21 +24,28 @@ Any other `/`-prefixed text passes through as a prompt.
 ## Install
 
 ```sh
-dsh plugin --profile web add dsh-plugin-discord
+dsh plugin --profile web add github:ghbhiee/dsh-plugin-discord
 ```
+
+Provide the bot token via the `DSH_DISCORD_TOKEN` environment variable of the
+dsh process (recommended — nothing secret touches the profile YAML). Under a
+launchd deployment that means the service plist's `EnvironmentVariables` dict;
+under systemd, an `Environment=` line; in a shell, plain `export`.
 
 Then configure the row in the profile's `cordis.patch.yml`:
 
 ```yaml
 - id: discord-bridge
   config:
-    # token: ""                      # or leave empty and export DSH_DISCORD_TOKEN
     allowedUsers: ["<your discord user id>"]
     # allowedChannels: ["<guild channel id>"]   # empty = DM-only
     cwd: /Users/you/projects         # where new sessions live
     # preset: ""                     # agent preset; empty = deployment default
     # titlePrefix: "[Discord] "
 ```
+
+Token lookup order: `config.token` → `$DSH_DISCORD_TOKEN` (name configurable
+via `tokenEnv`) → `tokenFile` (raw token or an env-style file).
 
 The bridge **refuses to start** when both allowlists are empty — an unrestricted bridge would hand your agent (and its tools) to anyone who can DM the bot.
 

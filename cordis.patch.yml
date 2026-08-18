@@ -6,9 +6,11 @@
 #
 #   - id: discord-bridge
 #     config:
-#       token: ""            # or leave empty and export DSH_DISCORD_TOKEN
-#       allowedUsers: ["553530366447714505"]
+#       allowedUsers: ["<your discord user id>"]
 #       cwd: /Users/you/projects
+#
+# Token: export DSH_DISCORD_TOKEN in the dsh process environment (or set
+# config.token / config.tokenFile).
 - insert:
     - id: discord-bridge
       name: dsh-plugin-discord

@@ -7,7 +7,7 @@
  *   - id: discord-bridge
  *     config:
  *       token: test-token
- *       allowedUsers: ["553530366447714505"]
+ *       allowedUsers: ["<your discord user id>"]
  *       gatewayUrl: ws://127.0.0.1:8931
  *       restBaseUrl: http://127.0.0.1:8932
  *
@@ -22,7 +22,8 @@ import { WebSocketServer } from 'ws'
 
 const GATEWAY_PORT = 8931
 const REST_PORT = 8932
-const USER_ID = '553530366447714505'
+// Must match an entry in the plugin's allowedUsers config.
+const USER_ID = process.env.FAKE_DISCORD_USER ?? '000000000000000001'
 const CHANNEL = 'e2e-channel-1'
 const SCRIPT = process.argv.slice(2).length > 0
   ? process.argv.slice(2)

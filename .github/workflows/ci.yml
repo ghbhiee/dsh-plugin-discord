@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Version comes from the root package.json "packageManager" field, so the
+      # toolchain has one source of truth; passing `version` here too would make
+      # pnpm/action-setup error on the duplicate.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the engines field: ^22.19.0 || >=24.0.0
+          node-version: 24
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # typecheck -> test (vitest, incl. real-WebSocket gateway protocol) -> build (tsdown)
+      - name: Check
+        run: pnpm run check
