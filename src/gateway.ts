@@ -24,6 +24,14 @@ export interface GatewayMessageAuthor {
   bot?: boolean
 }
 
+/** One file the user attached to a Discord message. */
+export interface GatewayAttachment {
+  url: string
+  filename: string
+  size: number
+  content_type?: string
+}
+
 /** One MESSAGE_CREATE dispatch, narrowed to the fields the bridge reads. */
 export interface GatewayMessage {
   id: string
@@ -31,6 +39,7 @@ export interface GatewayMessage {
   guild_id?: string
   content: string
   author: GatewayMessageAuthor
+  attachments?: GatewayAttachment[]
 }
 
 /** Ready facts the bridge needs: who the bot is, and how to resume. */

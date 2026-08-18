@@ -25,6 +25,20 @@ appear in the `/` picker). Plain-text forms keep working as a fallback — typin
 
 Any other `/`-prefixed text passes through as a prompt.
 
+## File transfer
+
+Both directions work, and the agent is told about them (a capability notice is
+injected once per session when it is first driven from Discord):
+
+- **Agent → Discord**: the agent writes a line `[discord-file: /absolute/path]`
+  in its reply; the bridge strips the line, and uploads the file as a Discord
+  attachment (images render inline). Only files under the session's working
+  directory (plus configured `uploadRoots`) and within `maxUploadBytes` are
+  sent — a refusal is reported in the reply.
+- **Discord → agent**: files/images the user attaches are saved under the
+  session cwd's `.discord-uploads/` and their paths are appended to the
+  prompt, so the agent can read them directly.
+
 ## Install
 
 ```sh
@@ -67,6 +81,9 @@ The bridge **refuses to start** when both allowlists are empty — an unrestrict
 | `preset` | `""` | Agent preset for new sessions; empty composes the default |
 | `titlePrefix` | `"[Discord] "` | Title prefix marking Discord-originated sessions |
 | `maxChunksPerReply` | `6` | Cap on Discord messages per reply (overflow truncated with a notice) |
+| `maxUploadBytes` | `8000000` | Cap on one outgoing attachment (`[discord-file: …]`) |
+| `uploadRoots` | `[]` | Extra directories the agent may upload from (session cwd is always allowed) |
+| `maxIncomingBytes` | `25000000` | Cap on one incoming Discord attachment saved to disk |
 | `stateFile` | `""` | Channel→session binding file; empty derives one in the profile dir |
 | `typingIntervalMs` | `8000` | Typing-indicator refresh while a turn runs |
 | `gatewayUrl` | `""` | Gateway URL override — a test seam for `scripts/fake-discord.mjs` |

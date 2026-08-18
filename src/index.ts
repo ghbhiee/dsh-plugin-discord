@@ -53,6 +53,12 @@ export interface Config {
   titlePrefix: string
   /** Cap on Discord messages sent per reply. */
   maxChunksPerReply: number
+  /** Cap on one outgoing attachment the agent sends via [discord-file: …]. */
+  maxUploadBytes: number
+  /** Directories (besides the session cwd) the agent may upload files from. */
+  uploadRoots: string[]
+  /** Cap on one incoming Discord attachment saved to disk. */
+  maxIncomingBytes: number
   /** Channel→session binding file; empty derives one under the profile directory. */
   stateFile: string
   /** Typing-indicator refresh cadence while a turn runs. */
@@ -75,6 +81,9 @@ export const Config: z<Config> = z.object({
   preset: z.string().default(''),
   titlePrefix: z.string().default('[Discord] '),
   maxChunksPerReply: z.number().default(6),
+  maxUploadBytes: z.number().default(8_000_000),
+  uploadRoots: z.array(z.string()).default([]),
+  maxIncomingBytes: z.number().default(25_000_000),
   stateFile: z.string().default(''),
   typingIntervalMs: z.number().default(8000),
   gatewayUrl: z.string().default(''),
@@ -204,6 +213,9 @@ export function apply(ctx: Context, config: Config): void {
           preset: config.preset,
           titlePrefix: config.titlePrefix,
           maxChunksPerReply: config.maxChunksPerReply,
+          maxUploadBytes: config.maxUploadBytes,
+          uploadRoots: config.uploadRoots,
+          maxIncomingBytes: config.maxIncomingBytes,
         },
         log: (level, text) => { logger[level](`discord-bridge: ${text}`) },
       })
@@ -228,13 +240,27 @@ export function apply(ctx: Context, config: Config): void {
         }
         const command = parseCommand(content)
         void (async () => {
-          const chunks = await bridge.handle(command, message.channel_id, message.id, () => beginTypingFor(message.channel_id))
-          for (const [index, chunk] of chunks.entries()) {
+          const reply = await bridge.handle(
+            command,
+            message.channel_id,
+            message.id,
+            () => beginTypingFor(message.channel_id),
+            message.attachments ?? [],
+          )
+          for (const [index, chunk] of reply.chunks.entries()) {
             try {
               await rest.createMessage(message.channel_id, chunk, index === 0 ? message.id : undefined)
             } catch (error) {
               logger.warn(`discord-bridge: send failed: ${String(error)}`)
               break
+            }
+          }
+          if (reply.files.length > 0) {
+            try {
+              await rest.createMessageWithFiles(message.channel_id, '', reply.files)
+            } catch (error) {
+              logger.warn(`discord-bridge: file upload failed: ${String(error)}`)
+              await rest.createMessage(message.channel_id, '⚠️ 附件上传失败,文件仍在服务器上。').catch(() => { /* best effort */ })
             }
           }
         })().catch((error: unknown) => {
@@ -265,10 +291,10 @@ export function apply(ctx: Context, config: Config): void {
           }
           // Deferred ack buys 15 minutes and shows "thinking…" in the client.
           await rest.ackDeferred(interaction.id, interaction.token)
-          const chunks = await bridge.handle(command, channelId, interaction.id, () => () => {})
+          const reply = await bridge.handle(command, channelId, interaction.id, () => () => {})
           const appId = applicationId
           if (appId === undefined) return
-          const [first, ...others] = chunks
+          const [first, ...others] = reply.chunks
           await rest.editOriginalResponse(appId, interaction.token, first ?? '(无输出)')
           for (const chunk of others) await rest.followupResponse(appId, interaction.token, chunk)
         })().catch((error: unknown) => {

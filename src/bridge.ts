@@ -13,7 +13,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { basename, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
@@ -23,6 +24,8 @@ import type { BridgeCommand } from './commands.ts'
 import { HELP_TEXT } from './commands.ts'
 import { chunkReply } from './chunk.ts'
 import { extractReply, findPromptSeq } from './reply.ts'
+import { capabilityNotice, extractFileMarkers, isPathUnder, sanitizeFilename } from './attachments.ts'
+import type { GatewayAttachment } from './gateway.ts'
 import type { BindingStore } from './state.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -47,6 +50,18 @@ export interface BridgeConfig {
   titlePrefix: string
   /** Cap on Discord messages per reply. */
   maxChunksPerReply: number
+  /** Cap on one outgoing attachment. */
+  maxUploadBytes: number
+  /** Directories (besides the session cwd) the agent may upload from. */
+  uploadRoots: string[]
+  /** Cap on one incoming attachment saved to disk. */
+  maxIncomingBytes: number
+}
+
+/** One reply: text chunks plus any files the agent asked to attach. */
+export interface BridgeReply {
+  chunks: string[]
+  files: { filename: string; data: Uint8Array }[]
 }
 
 /** Session-header facts the bridge reads from persistence listings. */
@@ -68,6 +83,8 @@ export class SessionBridge {
   private readonly channelChains = new Map<string, Promise<void>>()
   /** Deduplicates concurrent create/resume of one session id. */
   private readonly acquisitions = new Map<string, Promise<Agent>>()
+  /** Live agents that already received the capability notice. */
+  private readonly noticed = new WeakSet<Agent>()
 
   constructor(options: {
     ctx: Context
@@ -84,35 +101,39 @@ export class SessionBridge {
   }
 
   /**
-   * Handle one parsed command; replies are returned as sendable chunks.
+   * Handle one parsed command; replies carry text chunks and any attachments.
    * Prompts serialize per channel; management commands answer immediately.
    * @param command - the parsed instruction.
    * @param channelId - Discord channel the message arrived in.
    * @param messageId - Discord message id (stamped onto the prompt's source).
    * @param beginTyping - starts a typing indicator; returns its stopper.
-   * @returns reply chunks, each within Discord's message limit.
+   * @param attachments - files the user attached to the Discord message.
+   * @returns the reply; each chunk is within Discord's message limit.
    */
   async handle(
     command: BridgeCommand,
     channelId: string,
     messageId: string,
     beginTyping: () => () => void,
-  ): Promise<string[]> {
+    attachments: readonly GatewayAttachment[] = [],
+  ): Promise<BridgeReply> {
+    const text = async (chunks: Promise<string[]> | string[]): Promise<BridgeReply> =>
+      ({ chunks: await chunks, files: [] })
     switch (command.kind) {
       case 'help':
-        return [HELP_TEXT]
+        return await text([HELP_TEXT])
       case 'new':
-        return await this.commandNew(channelId, command.label)
+        return await text(this.commandNew(channelId, command.label))
       case 'sessions':
-        return await this.commandSessions(channelId)
+        return await text(this.commandSessions(channelId))
       case 'use':
-        return await this.commandUse(channelId, command.sessionId)
+        return await text(this.commandUse(channelId, command.sessionId))
       case 'current':
-        return await this.commandCurrent(channelId)
+        return await text(this.commandCurrent(channelId))
       case 'stop':
-        return this.commandStop(channelId)
+        return await text(this.commandStop(channelId))
       case 'prompt':
-        return await this.enqueuePrompt(channelId, messageId, command.text, beginTyping)
+        return await this.enqueuePrompt(channelId, messageId, command.text, beginTyping, attachments)
     }
   }
 
@@ -279,11 +300,90 @@ export class SessionBridge {
     messageId: string,
     text: string,
     beginTyping: () => () => void,
-  ): Promise<string[]> {
+    attachments: readonly GatewayAttachment[],
+  ): Promise<BridgeReply> {
     const previous = this.channelChains.get(channelId) ?? Promise.resolve()
-    const run = previous.then(async () => await this.runPrompt(channelId, messageId, text, beginTyping))
+    const run = previous.then(async () => await this.runPrompt(channelId, messageId, text, beginTyping, attachments))
     this.channelChains.set(channelId, run.then(() => undefined, () => undefined))
     return await run
+  }
+
+  /** Tell a freshly acquired agent about the bridge's transport abilities, once. */
+  private injectNoticeOnce(agent: Agent): void {
+    if (this.noticed.has(agent)) return
+    this.noticed.add(agent)
+    agent.inject(this.host.createUserMessage({
+      content: [{ type: 'text', text: capabilityNotice(this.config.maxUploadBytes) }],
+      source: { kind: 'plugin', plugin: 'dsh-plugin-discord', form: 'instructions' },
+    }))
+  }
+
+  /** Save the user's Discord attachments under the session cwd; describe them for the prompt. */
+  private async saveIncoming(
+    agentCwd: string,
+    messageId: string,
+    attachments: readonly GatewayAttachment[],
+  ): Promise<string[]> {
+    const notes: string[] = []
+    const directory = join(agentCwd, '.discord-uploads')
+    for (const attachment of attachments.slice(0, 5)) {
+      try {
+        if (attachment.size > this.config.maxIncomingBytes) {
+          notes.push(`[Discord 附件 ${attachment.filename} 超过 ${String(Math.floor(this.config.maxIncomingBytes / 1_000_000))}MB,未保存]`)
+          continue
+        }
+        const response = await fetch(attachment.url)
+        if (!response.ok) throw new Error(`download failed: ${String(response.status)}`)
+        const data = new Uint8Array(await response.arrayBuffer())
+        await mkdir(directory, { recursive: true })
+        const target = join(directory, `${messageId}-${sanitizeFilename(attachment.filename)}`)
+        await writeFile(target, data)
+        notes.push(`[用户通过 Discord 发来文件,已保存: ${target}${attachment.content_type === undefined ? '' : ` (${attachment.content_type})`}]`)
+      } catch (error) {
+        this.log('warn', `incoming attachment failed: ${String(error)}`)
+        notes.push(`[Discord 附件 ${attachment.filename} 保存失败]`)
+      }
+    }
+    return notes
+  }
+
+  /** Read the agent's marked files, enforcing containment and the size cap. */
+  private async collectUploads(agentCwd: string, paths: readonly string[]): Promise<{
+    files: BridgeReply['files']
+    problems: string[]
+  }> {
+    const files: BridgeReply['files'] = []
+    const problems: string[] = []
+    const roots: string[] = []
+    for (const root of [agentCwd, ...this.config.uploadRoots]) {
+      try {
+        roots.push(await realpath(root))
+      } catch {
+        // A configured root that does not exist grants nothing.
+      }
+    }
+    for (const path of paths.slice(0, 10)) {
+      try {
+        const resolved = await realpath(path)
+        if (!roots.some(root => isPathUnder(resolved, root))) {
+          problems.push(`⚠️ 未发送 ${path}:不在允许目录内(会话工作目录${this.config.uploadRoots.length > 0 ? ' + uploadRoots' : ''})。`)
+          continue
+        }
+        const info = await stat(resolved)
+        if (!info.isFile()) {
+          problems.push(`⚠️ 未发送 ${path}:不是普通文件。`)
+          continue
+        }
+        if (info.size > this.config.maxUploadBytes) {
+          problems.push(`⚠️ 未发送 ${path}:${String(Math.ceil(info.size / 1_000_000))}MB 超过上限 ${String(Math.floor(this.config.maxUploadBytes / 1_000_000))}MB。`)
+          continue
+        }
+        files.push({ filename: basename(resolved), data: new Uint8Array(await readFile(resolved)) })
+      } catch (error) {
+        problems.push(`⚠️ 未发送 ${path}:${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return { files, problems }
   }
 
   private async runPrompt(
@@ -291,15 +391,23 @@ export class SessionBridge {
     messageId: string,
     text: string,
     beginTyping: () => () => void,
-  ): Promise<string[]> {
+    attachments: readonly GatewayAttachment[],
+  ): Promise<BridgeReply> {
     const stopTyping = beginTyping()
     try {
       const { agent, created, title } = await this.ensureChannelAgent(channelId)
       const preamble = created && title !== undefined
         ? [`(已自动新建会话 **${title}** · \`${agent.id}\`)`]
         : []
+      this.injectNoticeOnce(agent)
+      const agentCwd = agent.session.header.cwd ?? this.config.cwd
+      let promptText = text
+      if (attachments.length > 0) {
+        const notes = await this.saveIncoming(agentCwd, messageId, attachments)
+        if (notes.length > 0) promptText = `${promptText}\n\n${notes.join('\n')}`.trim()
+      }
       agent.followup(this.host.createUserMessage({
-        content: [{ type: 'text', text }],
+        content: [{ type: 'text', text: promptText }],
         source: { kind: 'user', discordMessageId: messageId, discordChannelId: channelId },
       }))
       await agent.whenIdle()
@@ -309,19 +417,24 @@ export class SessionBridge {
       const events = agent.session.events as readonly { seq: number; type: string; data?: unknown }[]
       const promptSeq = findPromptSeq(events, messageId)
       if (promptSeq === undefined) {
-        return [...preamble, '⚠️ 消息没有进入会话(可能被取消),请重试。']
+        return { chunks: [...preamble, '⚠️ 消息没有进入会话(可能被取消),请重试。'], files: [] }
       }
       const reply = extractReply(events, promptSeq)
       if (reply.reasonKind === 'completed' || (reply.reasonKind === undefined && reply.text !== '')) {
-        const chunks = chunkReply(reply.text, this.config.maxChunksPerReply)
-        return chunks.length === 0 ? [...preamble, '(本回合没有文本回复)'] : [...preamble, ...chunks]
+        const { text: cleaned, paths } = extractFileMarkers(reply.text)
+        const uploads = await this.collectUploads(agentCwd, paths)
+        const chunks = chunkReply(cleaned, this.config.maxChunksPerReply)
+        const body = chunks.length === 0 && uploads.files.length === 0
+          ? [...preamble, '(本回合没有文本回复)']
+          : [...preamble, ...chunks, ...uploads.problems]
+        return { chunks: body, files: uploads.files }
       }
-      if (reply.reasonKind === 'cancelled') return [...preamble, '⏹️ 回合被取消。']
+      if (reply.reasonKind === 'cancelled') return { chunks: [...preamble, '⏹️ 回合被取消。'], files: [] }
       const detail = reply.errorMessage ?? reply.reasonKind ?? 'unknown'
-      return [...preamble, `⚠️ 回合失败: ${detail}`]
+      return { chunks: [...preamble, `⚠️ 回合失败: ${detail}`], files: [] }
     } catch (error) {
       this.log('warn', `prompt failed: ${String(error)}`)
-      return [`⚠️ 出错了: ${error instanceof Error ? error.message : String(error)}`]
+      return { chunks: [`⚠️ 出错了: ${error instanceof Error ? error.message : String(error)}`], files: [] }
     } finally {
       stopTyping()
     }
