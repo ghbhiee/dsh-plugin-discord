@@ -18,9 +18,9 @@ import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-session'
 import { DiscordGateway, INTENTS } from './gateway.ts'
-import type { GatewayMessage } from './gateway.ts'
+import type { GatewayInteraction, GatewayMessage } from './gateway.ts'
 import { DiscordRest } from './rest.ts'
-import { parseCommand } from './commands.ts'
+import { APPLICATION_COMMANDS, commandFromInteraction, parseCommand } from './commands.ts'
 import { SessionBridge } from './bridge.ts'
 import { BindingStore } from './state.ts'
 import { loadHostModules } from './host-modules.ts'
@@ -166,6 +166,8 @@ export function apply(ctx: Context, config: Config): void {
     let rest: DiscordRest
     const store = new BindingStore(resolveStateFile(config.stateFile, ctx.baseUrl))
     let botUserId: string | undefined
+    let applicationId: string | undefined
+    let commandsRegistered = false
     const emptyContentWarned = new Set<string>()
 
     const beginTypingFor = (channelId: string): (() => void) => {
@@ -240,15 +242,60 @@ export function apply(ctx: Context, config: Config): void {
         })
       }
 
+      const onInteraction = (interaction: GatewayInteraction): void => {
+        const commandName = interaction.data?.name
+        if (commandName === undefined) return
+        const author = interaction.member?.user ?? interaction.user
+        if (author === undefined) return
+        const channelId = interaction.channel_id ?? ''
+        const admission = {
+          ...interaction.guild_id === undefined ? {} : { guild_id: interaction.guild_id },
+          channel_id: channelId,
+          author,
+        }
+        void (async () => {
+          if (!isAllowed(admission, botUserId, config.allowedUsers, config.allowedChannels)) {
+            await rest.ackEphemeral(interaction.id, interaction.token, '未授权使用这个桥接。')
+            return
+          }
+          const command = commandFromInteraction(commandName, interaction.data?.options ?? [])
+          if (command === undefined) {
+            await rest.ackEphemeral(interaction.id, interaction.token, `未知命令 /${commandName}`)
+            return
+          }
+          // Deferred ack buys 15 minutes and shows "thinking…" in the client.
+          await rest.ackDeferred(interaction.id, interaction.token)
+          const chunks = await bridge.handle(command, channelId, interaction.id, () => () => {})
+          const appId = applicationId
+          if (appId === undefined) return
+          const [first, ...others] = chunks
+          await rest.editOriginalResponse(appId, interaction.token, first ?? '(无输出)')
+          for (const chunk of others) await rest.followupResponse(appId, interaction.token, chunk)
+        })().catch((error: unknown) => {
+          logger.warn(`discord-bridge: interaction handling failed: ${String(error)}`)
+        })
+      }
+
       gateway = new DiscordGateway({
         token,
         intents: INTENTS.GUILDS | INTENTS.GUILD_MESSAGES | INTENTS.DIRECT_MESSAGES | INTENTS.MESSAGE_CONTENT,
         ...config.gatewayUrl === '' ? {} : { url: config.gatewayUrl },
         hooks: {
           onMessage,
+          onInteraction,
           onReady: (ready) => {
             botUserId = ready.botUserId
+            applicationId = ready.applicationId
             logger.info(`discord-bridge: gateway ready (bot ${ready.botUserId})`)
+            if (!commandsRegistered && applicationId !== undefined) {
+              commandsRegistered = true
+              rest.bulkOverwriteCommands(applicationId, APPLICATION_COMMANDS).then(() => {
+                logger.info('discord-bridge: slash commands registered')
+              }, (error: unknown) => {
+                commandsRegistered = false
+                logger.warn(`discord-bridge: slash command registration failed (text commands still work): ${String(error)}`)
+              })
+            }
           },
           onFatal: (reason) => {
             logger.warn(`discord-bridge: gateway gave up: ${reason}`)

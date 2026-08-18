@@ -76,4 +76,38 @@ export class DiscordRest {
   async triggerTyping(channelId: string): Promise<void> {
     await this.request('POST', `/channels/${channelId}/typing`)
   }
+
+  /** Replace the application's global slash commands (idempotent bulk overwrite). */
+  async bulkOverwriteCommands(applicationId: string, commands: readonly unknown[]): Promise<void> {
+    await this.request('PUT', `/applications/${applicationId}/commands`, commands)
+  }
+
+  /** Acknowledge an interaction with a deferred reply ("thinking…", 15-minute window). */
+  async ackDeferred(interactionId: string, interactionToken: string): Promise<void> {
+    await this.request('POST', `/interactions/${interactionId}/${interactionToken}/callback`, { type: 5 })
+  }
+
+  /** Immediately answer an interaction with an ephemeral message (only the invoker sees it). */
+  async ackEphemeral(interactionId: string, interactionToken: string, content: string): Promise<void> {
+    await this.request('POST', `/interactions/${interactionId}/${interactionToken}/callback`, {
+      type: 4,
+      data: { content, flags: 64, allowed_mentions: { parse: [] } },
+    })
+  }
+
+  /** Fill in the deferred reply. */
+  async editOriginalResponse(applicationId: string, interactionToken: string, content: string): Promise<void> {
+    await this.request('PATCH', `/webhooks/${applicationId}/${interactionToken}/messages/@original`, {
+      content,
+      allowed_mentions: { parse: [] },
+    })
+  }
+
+  /** Additional chunks after the deferred reply. */
+  async followupResponse(applicationId: string, interactionToken: string, content: string): Promise<void> {
+    await this.request('POST', `/webhooks/${applicationId}/${interactionToken}`, {
+      content,
+      allowed_mentions: { parse: [] },
+    })
+  }
 }

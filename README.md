@@ -7,7 +7,11 @@ Discord bridge for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-ha
 - Sessions are created through the same agent-preset composition the web host uses, so they carry the full toolchain and can be opened, continued, and renamed in the web UI at any time. A session created on the web can be adopted from Discord with `/use <id>`.
 - Zero runtime dependencies: the gateway runs on Node's built-in WebSocket, REST on built-in fetch.
 
-## Commands (plain text, no Discord app-command registration needed)
+## Commands
+
+On startup the bridge registers these as real Discord slash commands (they
+appear in the `/` picker). Plain-text forms keep working as a fallback — typing
+`/new` and hitting Enter works even before registration propagates.
 
 | Command | Effect |
 |---|---|
@@ -59,7 +63,7 @@ The bridge **refuses to start** when both allowlists are empty — an unrestrict
 | `tokenFileKey` | `DISCORD_BOT_TOKEN` | Key looked up when `tokenFile` is env-style |
 | `allowedUsers` | `[]` | Discord user ids allowed to talk (required for DMs) |
 | `allowedChannels` | `[]` | Guild channel ids the bridge listens in; empty = DM-only |
-| `cwd` | home dir | Working directory of new sessions |
+| `cwd` | home dir | Working directory of **newly created** sessions (created if missing). An already-bound session keeps the cwd it was created with — use `/new` after changing this |
 | `preset` | `""` | Agent preset for new sessions; empty composes the default |
 | `titlePrefix` | `"[Discord] "` | Title prefix marking Discord-originated sessions |
 | `maxChunksPerReply` | `6` | Cap on Discord messages per reply (overflow truncated with a notice) |

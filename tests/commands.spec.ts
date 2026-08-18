@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseCommand } from '../src/commands.ts'
+import { APPLICATION_COMMANDS, commandFromInteraction, parseCommand } from '../src/commands.ts'
 
 describe('parseCommand', () => {
   it('treats plain text as a prompt', () => {
@@ -46,5 +46,35 @@ describe('parseCommand', () => {
 
   it('trims surrounding whitespace before parsing', () => {
     expect(parseCommand('  /new  x  ')).toEqual({ kind: 'new', label: 'x' })
+  })
+})
+
+describe('commandFromInteraction', () => {
+  it('maps /new with and without a title option', () => {
+    expect(commandFromInteraction('new', [])).toEqual({ kind: 'new', label: '' })
+    expect(commandFromInteraction('new', [{ name: 'title', value: ' 计划 ' }])).toEqual({ kind: 'new', label: '计划' })
+  })
+
+  it('maps /use with its session option', () => {
+    expect(commandFromInteraction('use', [{ name: 'session', value: 'session-abc' }]))
+      .toEqual({ kind: 'use', sessionId: 'session-abc' })
+  })
+
+  it('maps the parameterless commands', () => {
+    expect(commandFromInteraction('sessions', [])).toEqual({ kind: 'sessions' })
+    expect(commandFromInteraction('current', [])).toEqual({ kind: 'current' })
+    expect(commandFromInteraction('stop', [])).toEqual({ kind: 'stop' })
+    expect(commandFromInteraction('help', [])).toEqual({ kind: 'help' })
+  })
+
+  it('rejects unknown names and non-string option values', () => {
+    expect(commandFromInteraction('nuke', [])).toBeUndefined()
+    expect(commandFromInteraction('use', [{ name: 'session', value: 42 }])).toEqual({ kind: 'use', sessionId: '' })
+  })
+
+  it('every registered command maps to a bridge command', () => {
+    for (const command of APPLICATION_COMMANDS) {
+      expect(commandFromInteraction(command.name, []), command.name).toBeDefined()
+    }
   })
 })

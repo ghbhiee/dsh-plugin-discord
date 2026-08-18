@@ -36,8 +36,23 @@ export interface GatewayMessage {
 /** Ready facts the bridge needs: who the bot is, and how to resume. */
 export interface GatewayReady {
   botUserId: string
+  /** Application id used for command registration and interaction webhooks. */
+  applicationId: string | undefined
   sessionId: string
   resumeGatewayUrl: string
+}
+
+/** One INTERACTION_CREATE dispatch, narrowed to the fields the bridge reads. */
+export interface GatewayInteraction {
+  id: string
+  token: string
+  channel_id?: string
+  guild_id?: string
+  /** Present for guild invocations; the user rides inside. */
+  member?: { user?: GatewayMessageAuthor }
+  /** Present for DM invocations. */
+  user?: GatewayMessageAuthor
+  data?: { name?: string; options?: { name: string; value?: unknown }[] }
 }
 
 interface GatewayPayload {
@@ -50,6 +65,7 @@ interface GatewayPayload {
 /** Injected effects, so tests can drive the client without Discord. */
 export interface GatewayHooks {
   onMessage: (message: GatewayMessage) => void
+  onInteraction?: (interaction: GatewayInteraction) => void
   onReady?: (ready: GatewayReady) => void
   /** Terminal failure: the client stopped retrying (bad token, intent refusal). */
   onFatal?: (reason: string) => void
@@ -278,6 +294,7 @@ export class DiscordGateway {
       case 'READY': {
         const data = payload.d as {
           user: { id: string }
+          application?: { id?: string }
           session_id: string
           resume_gateway_url: string
         }
@@ -286,6 +303,7 @@ export class DiscordGateway {
         this.backoffMs = 1000
         this.options.hooks.onReady?.({
           botUserId: data.user.id,
+          applicationId: data.application?.id,
           sessionId: data.session_id,
           resumeGatewayUrl: data.resume_gateway_url,
         })
@@ -299,6 +317,12 @@ export class DiscordGateway {
         const data = payload.d as GatewayMessage
         if (typeof data.id !== 'string' || typeof data.channel_id !== 'string') return
         this.options.hooks.onMessage(data)
+        return
+      }
+      case 'INTERACTION_CREATE': {
+        const data = payload.d as GatewayInteraction
+        if (typeof data.id !== 'string' || typeof data.token !== 'string') return
+        this.options.hooks.onInteraction?.(data)
         return
       }
       default:

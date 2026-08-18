@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { WebSocketServer } from 'ws'
 import type WsSocket from 'ws'
 import { DiscordGateway, INTENTS } from '../src/gateway.ts'
-import type { GatewayMessage, GatewayReady } from '../src/gateway.ts'
+import type { GatewayInteraction, GatewayMessage, GatewayReady } from '../src/gateway.ts'
 
 interface Received {
   op: number
@@ -86,8 +86,9 @@ describe('DiscordGateway', () => {
     expect(data.intents).toBe(baseIntents)
   })
 
-  it('dispatches MESSAGE_CREATE and reports READY facts', async () => {
+  it('dispatches MESSAGE_CREATE / INTERACTION_CREATE and reports READY facts', async () => {
     const messages: GatewayMessage[] = []
+    const interactions: GatewayInteraction[] = []
     let ready: GatewayReady | undefined
     client = new DiscordGateway({
       token: 't',
@@ -95,6 +96,7 @@ describe('DiscordGateway', () => {
       url: fake.url,
       hooks: {
         onMessage: (message) => { messages.push(message) },
+        onInteraction: (interaction) => { interactions.push(interaction) },
         onReady: (info) => { ready = info },
       },
     })
@@ -104,15 +106,21 @@ describe('DiscordGateway', () => {
     if (socket === undefined) throw new Error('no socket')
     socket.send(JSON.stringify({
       op: 0, s: 1, t: 'READY',
-      d: { user: { id: 'bot-1' }, session_id: 'sess-1', resume_gateway_url: 'ws://127.0.0.1:1' },
+      d: { user: { id: 'bot-1' }, application: { id: 'app-1' }, session_id: 'sess-1', resume_gateway_url: 'ws://127.0.0.1:1' },
     }))
     socket.send(JSON.stringify({
       op: 0, s: 2, t: 'MESSAGE_CREATE',
       d: { id: 'm1', channel_id: 'c1', content: 'hello', author: { id: 'u1' } },
     }))
-    await fake.waitFor(() => messages.length === 1)
+    socket.send(JSON.stringify({
+      op: 0, s: 3, t: 'INTERACTION_CREATE',
+      d: { id: 'i1', token: 'tok', channel_id: 'c1', user: { id: 'u1' }, data: { name: 'new', options: [] } },
+    }))
+    await fake.waitFor(() => messages.length === 1 && interactions.length === 1)
     expect(ready?.botUserId).toBe('bot-1')
+    expect(ready?.applicationId).toBe('app-1')
     expect(messages[0]?.content).toBe('hello')
+    expect(interactions[0]?.data?.name).toBe('new')
   })
 
   it('answers a server heartbeat request with the last seq', async () => {

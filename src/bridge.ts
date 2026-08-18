@@ -13,6 +13,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
@@ -180,6 +181,13 @@ export class SessionBridge {
 
   /** Create a fresh session the web UI can open, and bind the channel to it. */
   private async createSession(channelId: string, label: string): Promise<{ agent: Agent; title: string }> {
+    // Parity with the web host's ensureSession: the configured cwd may not
+    // exist yet, and an absent working directory breaks the session's tools.
+    try {
+      await mkdir(this.config.cwd, { recursive: true })
+    } catch (error) {
+      throw new Error(`failed to ensure session cwd "${this.config.cwd}": ${String(error)}`, { cause: error })
+    }
     const composition = await this.composeSetup(this.config.preset === '' ? undefined : this.config.preset)
     const id = `session-${randomUUID()}`
     const handle = await this.ctx.agents.create({
