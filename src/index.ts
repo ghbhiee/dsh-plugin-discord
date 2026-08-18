@@ -1,0 +1,271 @@
+/**
+ * Discord bridge for DeepSeek Harness.
+ *
+ * Connects one Discord bot to the web profile's session store: messages from
+ * allowlisted users drive ordinary dsh sessions — the same sessions the web
+ * UI lists, opens, and continues — and `/new` starts a fresh one named with a
+ * date-stamped `[Discord]` title so its origin is visible in the sidebar.
+ *
+ * @module dsh-plugin-discord
+ */
+
+import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import type {} from '@deepseek-ai/dsh-agent'
+import type {} from '@deepseek-ai/dsh-session'
+import { DiscordGateway, INTENTS } from './gateway.ts'
+import type { GatewayMessage } from './gateway.ts'
+import { DiscordRest } from './rest.ts'
+import { parseCommand } from './commands.ts'
+import { SessionBridge } from './bridge.ts'
+import { BindingStore } from './state.ts'
+import { loadHostModules } from './host-modules.ts'
+
+/** Cordis plugin name. */
+export const name = 'discord-bridge'
+
+/** Core services required before the bridge can start. */
+export const inject = ['agents', 'sessions', 'agentDefaultModel']
+
+/** Deployment-varying knobs. */
+export interface Config {
+  /** Bot token; empty falls back to `tokenEnv`, then `tokenFile`. */
+  token: string
+  /** Environment variable consulted when `token` is empty. */
+  tokenEnv: string
+  /** File to read the token from (keeps the secret out of profile YAML). Raw token, or an env-style file. */
+  tokenFile: string
+  /** Key looked up when `tokenFile` is env-style (`KEY=value` lines). */
+  tokenFileKey: string
+  /** Discord user ids allowed to talk to the bridge. Required for DMs. */
+  allowedUsers: string[]
+  /** Guild channel ids the bridge listens in; empty means DM-only. */
+  allowedChannels: string[]
+  /** Working directory new sessions are created in. */
+  cwd: string
+  /** Agent preset for new sessions; empty composes the deployment default. */
+  preset: string
+  /** Title prefix marking a session as Discord-originated. */
+  titlePrefix: string
+  /** Cap on Discord messages sent per reply. */
+  maxChunksPerReply: number
+  /** Channel→session binding file; empty derives one under the profile directory. */
+  stateFile: string
+  /** Typing-indicator refresh cadence while a turn runs. */
+  typingIntervalMs: number
+  /** Gateway URL override; empty uses Discord. A test seam for a local fake gateway. */
+  gatewayUrl: string
+  /** REST origin override; empty uses Discord. A test seam for a local fake API. */
+  restBaseUrl: string
+}
+
+/** Runtime schema for {@link Config}. */
+export const Config: z<Config> = z.object({
+  token: z.string().default(''),
+  tokenEnv: z.string().default('DSH_DISCORD_TOKEN'),
+  tokenFile: z.string().default(''),
+  tokenFileKey: z.string().default('DISCORD_BOT_TOKEN'),
+  allowedUsers: z.array(z.string()).default([]),
+  allowedChannels: z.array(z.string()).default([]),
+  cwd: z.string().default(homedir()),
+  preset: z.string().default(''),
+  titlePrefix: z.string().default('[Discord] '),
+  maxChunksPerReply: z.number().default(6),
+  stateFile: z.string().default(''),
+  typingIntervalMs: z.number().default(8000),
+  gatewayUrl: z.string().default(''),
+  restBaseUrl: z.string().default(''),
+})
+
+interface LoggerLike {
+  info: (...args: unknown[]) => void
+  warn: (...args: unknown[]) => void
+}
+
+function loggerOf(ctx: Context): LoggerLike {
+  // ctx.logger routes into the harness diagnostics sink, which the default
+  // launchd deployment does not surface anywhere; stdio does reach the service
+  // log, so operational lines go to the console ON TOP of the harness logger.
+  const candidate = (ctx as { logger?: LoggerLike }).logger
+  return {
+    info: (...args: unknown[]) => {
+      console.log('[discord-bridge]', ...args)
+      candidate?.info(...args)
+    },
+    warn: (...args: unknown[]) => {
+      console.warn('[discord-bridge]', ...args)
+      candidate?.warn(...args)
+    },
+  }
+}
+
+/** Where channel bindings persist: explicit config, else the profile directory. */
+export function resolveStateFile(configured: string, baseUrl: string | undefined): string {
+  if (configured !== '') return configured
+  if (baseUrl !== undefined && baseUrl.startsWith('file:')) {
+    try {
+      return join(fileURLToPath(baseUrl), 'discord-bridge-state.json')
+    } catch {
+      // Fall through to the home-directory default.
+    }
+  }
+  return join(homedir(), '.dsh', 'discord-bridge-state.json')
+}
+
+/**
+ * Resolve the bot token: explicit config, then environment, then token file.
+ * The file form keeps the secret out of profile YAML: it may hold the raw
+ * token, or `KEY=value` lines (an env file) looked up by `tokenFileKey`.
+ * @returns the token, or empty when nothing is configured.
+ */
+export async function resolveToken(config: Pick<Config, 'token' | 'tokenEnv' | 'tokenFile' | 'tokenFileKey'>): Promise<string> {
+  if (config.token.trim() !== '') return config.token.trim()
+  const fromEnv = (process.env[config.tokenEnv] ?? '').trim()
+  if (fromEnv !== '') return fromEnv
+  if (config.tokenFile === '') return ''
+  const raw = (await readFile(config.tokenFile, 'utf8')).trim()
+  if (!raw.includes('=')) return raw
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith(`${config.tokenFileKey}=`)) continue
+    return trimmed.slice(config.tokenFileKey.length + 1).trim().replace(/^["']|["']$/g, '')
+  }
+  return ''
+}
+
+/** Message admission: bots never, DMs by user allowlist, guilds by channel (and user when listed). */
+export function isAllowed(
+  message: Pick<GatewayMessage, 'guild_id' | 'channel_id'> & { author: { id: string; bot?: boolean } },
+  botUserId: string | undefined,
+  allowedUsers: readonly string[],
+  allowedChannels: readonly string[],
+): boolean {
+  if (message.author.bot === true) return false
+  if (botUserId !== undefined && message.author.id === botUserId) return false
+  const isDm = message.guild_id === undefined
+  if (isDm) return allowedUsers.includes(message.author.id)
+  if (!allowedChannels.includes(message.channel_id)) return false
+  return allowedUsers.length === 0 || allowedUsers.includes(message.author.id)
+}
+
+/** Wire the gateway, REST, and session bridge together for one deployment. */
+export function apply(ctx: Context, config: Config): void {
+  const logger = loggerOf(ctx)
+  if (config.allowedUsers.length === 0 && config.allowedChannels.length === 0) {
+    logger.warn('discord-bridge: allowedUsers and allowedChannels are both empty; refusing to expose the agent to arbitrary Discord users — bridge disabled')
+    return
+  }
+
+  ctx.effect(() => {
+    let disposed = false
+    let gateway: DiscordGateway | undefined
+    let rest: DiscordRest
+    const store = new BindingStore(resolveStateFile(config.stateFile, ctx.baseUrl))
+    let botUserId: string | undefined
+    const emptyContentWarned = new Set<string>()
+
+    const beginTypingFor = (channelId: string): (() => void) => {
+      let timer: ReturnType<typeof setInterval> | undefined
+      const fire = (): void => {
+        rest.triggerTyping(channelId).catch(() => { /* cosmetic */ })
+      }
+      fire()
+      timer = setInterval(fire, Math.max(config.typingIntervalMs, 3000))
+      return () => {
+        if (timer !== undefined) clearInterval(timer)
+        timer = undefined
+      }
+    }
+
+    const boot = (async () => {
+      const token = await resolveToken(config)
+      if (token === '') {
+        logger.warn(`discord-bridge: no bot token (set config.token, the ${config.tokenEnv} environment variable, or config.tokenFile); bridge disabled`)
+        return
+      }
+      rest = new DiscordRest({
+        token,
+        ...config.restBaseUrl === '' ? {} : { baseUrl: config.restBaseUrl },
+      })
+      await store.load()
+      const host = await loadHostModules(ctx.baseUrl)
+      const bridge = new SessionBridge({
+        ctx,
+        host,
+        store,
+        config: {
+          cwd: config.cwd,
+          preset: config.preset,
+          titlePrefix: config.titlePrefix,
+          maxChunksPerReply: config.maxChunksPerReply,
+        },
+        log: (level, text) => { logger[level](`discord-bridge: ${text}`) },
+      })
+
+      const me = await rest.getMe()
+      botUserId = me.id
+      logger.info(`discord-bridge: authenticated as ${me.username} (${me.id})`)
+      if (disposed) return
+
+      const onMessage = (message: GatewayMessage): void => {
+        if (!isAllowed(message, botUserId, config.allowedUsers, config.allowedChannels)) return
+        const content = message.content ?? ''
+        if (content.trim() === '') {
+          if (message.guild_id !== undefined && !emptyContentWarned.has(message.channel_id)) {
+            emptyContentWarned.add(message.channel_id)
+            void rest.createMessage(
+              message.channel_id,
+              '⚠️ 收到了空消息内容。如果你发的是文字,机器人缺少 MESSAGE_CONTENT intent(在 Discord developer portal 打开),或改用私聊。',
+            ).catch(() => { /* best effort */ })
+          }
+          return
+        }
+        const command = parseCommand(content)
+        void (async () => {
+          const chunks = await bridge.handle(command, message.channel_id, message.id, () => beginTypingFor(message.channel_id))
+          for (const [index, chunk] of chunks.entries()) {
+            try {
+              await rest.createMessage(message.channel_id, chunk, index === 0 ? message.id : undefined)
+            } catch (error) {
+              logger.warn(`discord-bridge: send failed: ${String(error)}`)
+              break
+            }
+          }
+        })().catch((error: unknown) => {
+          logger.warn(`discord-bridge: message handling failed: ${String(error)}`)
+        })
+      }
+
+      gateway = new DiscordGateway({
+        token,
+        intents: INTENTS.GUILDS | INTENTS.GUILD_MESSAGES | INTENTS.DIRECT_MESSAGES | INTENTS.MESSAGE_CONTENT,
+        ...config.gatewayUrl === '' ? {} : { url: config.gatewayUrl },
+        hooks: {
+          onMessage,
+          onReady: (ready) => {
+            botUserId = ready.botUserId
+            logger.info(`discord-bridge: gateway ready (bot ${ready.botUserId})`)
+          },
+          onFatal: (reason) => {
+            logger.warn(`discord-bridge: gateway gave up: ${reason}`)
+          },
+          log: (level, text) => { logger[level](`discord-bridge: ${text}`) },
+        },
+      })
+      if (!disposed) gateway.start()
+    })()
+    boot.catch((error: unknown) => {
+      logger.warn(`discord-bridge: boot failed: ${String(error)}`)
+    })
+
+    return () => {
+      disposed = true
+      gateway?.stop()
+      void store.flush()
+    }
+  }, 'discord bridge lifecycle')
+}

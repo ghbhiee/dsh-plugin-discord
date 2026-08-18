@@ -1,0 +1,14 @@
+# Patch layer contributed by dsh-plugin-discord.
+#
+# Adds one host-side row to the web profile: the Discord bridge. Everything
+# else in the bundle is inherited untouched. Configure the bridge by patching
+# this row's config in the profile's own cordis.patch.yml, e.g.
+#
+#   - id: discord-bridge
+#     config:
+#       token: ""            # or leave empty and export DSH_DISCORD_TOKEN
+#       allowedUsers: ["553530366447714505"]
+#       cwd: /Users/you/projects
+- insert:
+    - id: discord-bridge
+      name: dsh-plugin-discord
