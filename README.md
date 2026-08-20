@@ -29,13 +29,34 @@ Any other `/`-prefixed text passes through as a prompt.
 
 Every deployment's bridge also serves its own bot as a **push channel**, so
 agents and daemons can message the user proactively instead of only replying.
-Registered under `/plugins/discord` on the dsh web server, guarded by a bearer
-secret (config `notifySecret` → env `DSH_DISCORD_NOTIFY_SECRET` → an
-auto-generated secret persisted as `discord-notify.secret` in the profile
-directory, mode 0600). Because each dsh serves its own bot, sender identity
-follows the deployment: dsh 本地 notifies as its bot, dsh 服务端 as its bot.
+Because each dsh serves its own bot, sender identity follows the deployment:
+your local dsh notifies as its bot, your server's dsh as its bot.
 
-**Plain HTTP** (daemons, cron, shell one-liners):
+**What is automatic vs manual:**
+
+| Piece | Automatic? |
+|---|---|
+| MCP **server** endpoint (`POST /plugins/discord/mcp`) | ✅ served on plugin boot, nothing to do |
+| HTTP API (`POST /plugins/discord/api/notify`) | ✅ served on plugin boot |
+| Bearer secret | ✅ auto-generated on first boot → `<profile dir>/discord-notify.secret` (0600); override via config `notifySecret` or env `DSH_DISCORD_NOTIFY_SECRET` |
+| MCP **client** registration (making an agent see the tool) | ❌ one-time manual step per client, recipes below |
+
+Disable the whole surface with `notifyEnabled: false`.
+
+### HTTP API reference (for any application)
+
+`POST http://127.0.0.1:<dsh port>/plugins/discord/api/notify`
+
+| | |
+|---|---|
+| Auth | `Authorization: Bearer <secret>` — read the secret from `<profile dir>/discord-notify.secret` (e.g. `~/.dsh/profiles/web/discord-notify.secret`) |
+| Body | `{"content": "text", "userId"?: "...", "channelId"?: "..."}` — JSON, `content` required |
+| Target | default = DM of the first `allowedUsers` entry; `userId` = another user's DM; `channelId` = a guild channel the bot can post in |
+| Content | Discord markdown; text over 2000 chars is split into several messages automatically |
+| 200 | `{"ok": true, "channelId": "...", "messageIds": ["..."]}` |
+| 400 | bad JSON / empty content |
+| 401 | missing or wrong bearer token |
+| 502 | Discord-side delivery failure (`{"ok": false, "error": "..."}`) |
 
 ```sh
 curl -s -X POST http://127.0.0.1:3080/plugins/discord/api/notify \
@@ -44,11 +65,17 @@ curl -s -X POST http://127.0.0.1:3080/plugins/discord/api/notify \
   -d '{"content": "⚠️ 磁盘使用率 92%"}'
 ```
 
-`{"content", "userId"?, "channelId"?}` — default target is the first
-`allowedUsers` entry's DM. Long content is chunked automatically.
+The endpoint is loopback by default (dsh binds 127.0.0.1): callers on the same
+machine hit it directly; remote callers tunnel (`ssh -L 3080:127.0.0.1:3080 host`)
+or go through whatever reverse proxy already fronts your dsh.
 
-**MCP** (Streamable HTTP at `POST /plugins/discord/mcp`, tool `discord_notify`) —
-give the dsh agent itself the tool via a machine-wide `~/.dsh/cordis.patch.yml` row:
+### Registering the MCP client (one-time, per agent)
+
+The MCP server side (Streamable HTTP, tool **`discord_notify`**) is already
+running — these recipes just point a client at it.
+
+**dsh itself** (gives every dsh agent the tool) — machine-wide
+`~/.dsh/cordis.patch.yml`, then restart dsh:
 
 ```yaml
 - insert:
@@ -59,12 +86,47 @@ give the dsh agent itself the tool via a machine-wide `~/.dsh/cordis.patch.yml` 
         transport: streamable-http
         url: http://127.0.0.1:3080/plugins/discord/mcp
         headers:
-          authorization: Bearer <secret>
+          authorization: Bearer <contents of discord-notify.secret>
 ```
 
-Claude Code and other MCP clients connect the same way
-(`claude mcp add --transport http discord http://127.0.0.1:3080/plugins/discord/mcp --header "Authorization: Bearer <secret>"`).
-Set `notifyEnabled: false` to turn the whole surface off.
+**Claude Code:**
+
+```sh
+claude mcp add --transport http discord \
+  http://127.0.0.1:3080/plugins/discord/mcp \
+  --header "Authorization: Bearer $(cat ~/.dsh/profiles/web/discord-notify.secret)"
+```
+
+**Stdio-only MCP clients** (via mcp-remote):
+
+```json
+{ "command": "npx", "args": ["-y", "mcp-remote", "http://127.0.0.1:3080/plugins/discord/mcp", "--header", "Authorization: Bearer <secret>"] }
+```
+
+### Copy-paste prompts for other agents
+
+Give an agent this to make it **register the MCP itself** (fill in your paths):
+
+> 帮我接入本机 dsh 的 Discord 通知能力:MCP 端点是
+> `http://127.0.0.1:3080/plugins/discord/mcp`(transport: streamable-http),
+> 鉴权头 `Authorization: Bearer <密钥>`,密钥内容读文件
+> `~/.dsh/profiles/web/discord-notify.secret`。请把它注册进你的 MCP 配置,
+> 然后调用 `discord_notify` 工具发一条测试消息「MCP 接入成功」验证。
+
+Give an agent this to make it **use the HTTP API in code/scripts** (no MCP needed):
+
+> 本机有一个 Discord 推送接口,写监控/定时脚本需要通知我时调用它:
+> `POST http://127.0.0.1:3080/plugins/discord/api/notify`,
+> 请求头 `Authorization: Bearer $(cat ~/.dsh/profiles/web/discord-notify.secret)`
+> 和 `Content-Type: application/json`,请求体 `{"content": "通知文本"}`。
+> 返回 `{"ok": true}` 即送达;非 200 时把状态码和响应体记入日志,不要重试超过 3 次。
+
+Or drop this one-liner into an agent's standing instructions (CLAUDE.md 等),
+so it always knows the channel exists:
+
+> 需要主动通知用户时(任务完成、告警、提醒),POST
+> `http://127.0.0.1:3080/plugins/discord/api/notify`,Bearer 密钥在
+> `~/.dsh/profiles/web/discord-notify.secret`,body `{"content": "..."}`。
 
 ## Inline questions (ask_user_question → Discord components)
 
