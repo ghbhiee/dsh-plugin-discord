@@ -31,8 +31,8 @@ import { loadHostModules } from './host-modules.ts'
 /** Cordis plugin name. */
 export const name = 'discord-bridge'
 
-/** Core services required before the bridge can start. */
-export const inject = ['agents', 'sessions', 'agentDefaultModel']
+/** Core services required before the bridge can start. webServer carries the notify/MCP surface. */
+export const inject = ['agents', 'sessions', 'agentDefaultModel', 'webServer']
 
 /** Deployment-varying knobs. */
 export interface Config {
@@ -267,14 +267,10 @@ export function apply(ctx: Context, config: Config): void {
         log: (level, text) => { logger[level](`discord-bridge: ${text}`) },
       })
 
-      const me = await rest.getMe()
-      botUserId = me.id
-      logger.info(`discord-bridge: authenticated as ${me.username} (${me.id})`)
-      if (disposed) {
-        logger.info('discord-bridge: boot abandoned (effect disposed mid-boot)')
-        return
-      }
-
+      // The notify surface only needs the REST client and the secret — it is
+      // registered BEFORE any Discord round-trip so a Discord outage cannot
+      // take the local API down with it.
+      let botLabel = 'bot'
       const webServer = ctx.get('webServer') as
         | { register: (route: { kind: 'prefix'; path: string; handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void> }) => () => void; port?: number }
         | undefined
@@ -283,12 +279,33 @@ export function apply(ctx: Context, config: Config): void {
         const notifier = new DiscordNotifier(rest, config.allowedUsers[0], config.maxChunksPerReply)
         const handler = createNotifyHandler(
           secret,
-          { notifier, botLabel: () => me.username, version: '0.5.0' },
+          { notifier, botLabel: () => botLabel, version: '0.5.0' },
           (level, text) => { logger[level](`discord-bridge: ${text}`) },
         )
         disposeNotify = webServer.register({ kind: 'prefix', path: '/plugins/discord', handler })
         logger.info(`discord-bridge: notify API + MCP at /plugins/discord (secret: ${source})`)
       }
+
+      // Identity check with retry: discord.com is flaky from some networks,
+      // and a transient failure here must not kill the whole bridge for the
+      // process lifetime (it did, once, in production).
+      let me: { id: string; username: string } | undefined
+      for (let delay = 5000; !disposed; delay = Math.min(delay * 2, 60_000)) {
+        try {
+          me = await rest.getMe()
+          break
+        } catch (error) {
+          logger.warn(`discord-bridge: identity check failed (${String(error)}); retrying in ${String(delay / 1000)}s`)
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
+      }
+      if (me === undefined || disposed) {
+        if (!disposed) logger.info('discord-bridge: boot abandoned (effect disposed mid-boot)')
+        return
+      }
+      botUserId = me.id
+      botLabel = me.username
+      logger.info(`discord-bridge: authenticated as ${me.username} (${me.id})`)
 
       const onMessage = (message: GatewayMessage): void => {
         if (!isAllowed(message, botUserId, config.allowedUsers, config.allowedChannels)) return
