@@ -61,7 +61,9 @@ describe('DiscordNotifier', () => {
 const deps = (notifierSend: (target: unknown, content: string) => Promise<{ channelId: string; messageIds: string[] }>) => ({
   notifier: { send: notifierSend } as unknown as DiscordNotifier,
   botLabel: () => 'test-bot',
-  version: '0.5.0',
+  version: '0.5.1',
+  httpEndpoint: 'http://127.0.0.1:3080/plugins/discord/api/notify',
+  secretPath: '/tmp/notify.secret',
 })
 
 describe('handleMcpMessage', () => {
@@ -74,12 +76,18 @@ describe('handleMcpMessage', () => {
     expect(response.result.serverInfo.title).toContain('test-bot')
   })
 
-  it('lists the discord_notify tool', async () => {
+  it('lists the discord_notify tool with the scheduled-reminder recipe', async () => {
     const response = await handleMcpMessage(
       { jsonrpc: '2.0', id: 1, method: 'tools/list' },
       deps(async () => ({ channelId: 'c', messageIds: [] })),
-    ) as { result: { tools: { name: string }[] } }
+    ) as { result: { tools: { name: string; description: string }[] } }
     expect(response.result.tools.map(tool => tool.name)).toEqual(['discord_notify'])
+    const description = response.result.tools[0]?.description ?? ''
+    // Agents must learn the out-of-band HTTP recipe for reminders from the
+    // description itself — cron/launchd jobs cannot speak MCP.
+    expect(description).toContain('http://127.0.0.1:3080/plugins/discord/api/notify')
+    expect(description).toContain('$(cat /tmp/notify.secret)')
+    expect(description).toContain('SCHEDULED')
   })
 
   it('calls the tool and reports the delivery', async () => {

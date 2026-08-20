@@ -277,9 +277,18 @@ export function apply(ctx: Context, config: Config): void {
       if (config.notifyEnabled && webServer !== undefined) {
         const { secret, source } = await resolveNotifySecret(config, resolveStateFile(config.stateFile, ctx.baseUrl))
         const notifier = new DiscordNotifier(rest, config.allowedUsers[0], config.maxChunksPerReply)
+        const port = webServer.port ?? 3080
+        const secretFile = join(dirname(resolveStateFile(config.stateFile, ctx.baseUrl)), 'discord-notify.secret')
         const handler = createNotifyHandler(
           secret,
-          { notifier, botLabel: () => botLabel, version: '0.5.0' },
+          {
+            notifier,
+            botLabel: () => botLabel,
+            version: '0.5.1',
+            httpEndpoint: `http://127.0.0.1:${String(port)}/plugins/discord/api/notify`,
+            // The description points at the file only when the secret really lives there.
+            secretPath: source.startsWith('/') || source.includes('generated') ? secretFile : '',
+          },
           (level, text) => { logger[level](`discord-bridge: ${text}`) },
         )
         disposeNotify = webServer.register({ kind: 'prefix', path: '/plugins/discord', handler })

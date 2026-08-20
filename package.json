@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-discord",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Discord bridge for DeepSeek Harness: chat with your dsh sessions from Discord, sharing the very same sessions with the web UI",
   "license": "MIT",
   "author": "guohongbo@outlook.com",

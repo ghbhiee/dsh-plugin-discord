@@ -75,22 +75,35 @@ interface JsonRpcMessage {
   params?: Record<string, unknown>
 }
 
-const MCP_TOOL = {
-  name: 'discord_notify',
-  description: 'Send a proactive Discord message from this dsh deployment\'s bot. '
-    + 'Defaults to a DM to the deployment owner; pass userId for another allowlisted user\'s DM, '
-    + 'or channelId for a guild channel the bot can post in. Use for monitoring alerts, '
-    + 'reminders, and task-completion notifications.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      content: { type: 'string', description: 'Message text (Discord markdown; long text is split automatically).' },
-      userId: { type: 'string', description: 'Discord user id to DM. Optional; defaults to the deployment owner.' },
-      channelId: { type: 'string', description: 'Guild channel id to post in instead of a DM. Optional.' },
+/**
+ * The tool definition, with the deployment's own HTTP recipe baked into the
+ * description: calling this MCP tool sends NOW, but reminders and monitors
+ * fire later, from cron/launchd/sleep jobs that cannot speak MCP — so the
+ * description teaches the equivalent curl, endpoint and secret path included.
+ */
+function mcpTool(httpEndpoint: string, secretPath: string): Record<string, unknown> {
+  const secretExpr = secretPath === '' ? '<the same bearer secret this MCP connection uses>' : `$(cat ${secretPath})`
+  return {
+    name: 'discord_notify',
+    description: 'Send a proactive Discord message from this dsh deployment\'s bot, IMMEDIATELY. '
+      + 'Defaults to a DM to the deployment owner; pass userId for another allowlisted user\'s DM, '
+      + 'or channelId for a guild channel the bot can post in. Use for alerts and task-completion notices. '
+      + 'For a SCHEDULED or delayed reminder (提醒/闹钟/定时通知), do NOT call this tool now — instead create a timed job '
+      + '(sleep-in-background / at / cron / launchd) whose command sends the same notification over plain HTTP: '
+      + `curl -X POST ${httpEndpoint} -H "authorization: Bearer ${secretExpr}" `
+      + '-H "content-type: application/json" -d \'{"content": "提醒内容"}\'. '
+      + 'That endpoint is this same capability, callable without MCP, so it works from any scheduled job.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'Message text (Discord markdown; long text is split automatically).' },
+        userId: { type: 'string', description: 'Discord user id to DM. Optional; defaults to the deployment owner.' },
+        channelId: { type: 'string', description: 'Guild channel id to post in instead of a DM. Optional.' },
+      },
+      required: ['content'],
     },
-    required: ['content'],
-  },
-} as const
+  }
+}
 
 /** Dependencies of the MCP/HTTP handlers, injectable for tests. */
 export interface NotifyServiceDeps {
@@ -98,6 +111,10 @@ export interface NotifyServiceDeps {
   /** Human-readable sender identity, e.g. `dsh_mac`. */
   botLabel: () => string
   version: string
+  /** Public URL of the plain-HTTP notify endpoint, baked into the tool description. */
+  httpEndpoint: string
+  /** Path of the bearer-secret file, when one exists on disk; '' otherwise. */
+  secretPath: string
 }
 
 /**
@@ -125,10 +142,10 @@ export async function handleMcpMessage(message: JsonRpcMessage, deps: NotifyServ
     case 'ping':
       return respond({})
     case 'tools/list':
-      return respond({ tools: [MCP_TOOL] })
+      return respond({ tools: [mcpTool(deps.httpEndpoint, deps.secretPath)] })
     case 'tools/call': {
       const name = params?.name
-      if (name !== MCP_TOOL.name) return fail(-32602, `unknown tool ${String(name)}`)
+      if (name !== 'discord_notify') return fail(-32602, `unknown tool ${String(name)}`)
       const args = (params?.arguments ?? {}) as { content?: string; userId?: string; channelId?: string }
       if (typeof args.content !== 'string' || args.content.trim() === '') {
         return fail(-32602, 'arguments.content must be a non-empty string')
