@@ -25,6 +25,27 @@ appear in the `/` picker). Plain-text forms keep working as a fallback — typin
 
 Any other `/`-prefixed text passes through as a prompt.
 
+## Inline questions (ask_user_question → Discord components)
+
+When the agent asks the user a question (dsh's `ask_user_question` tool — option
+picks, confirmations, plan reviews), the bridge renders it as **Discord inline
+components** in the bound channel: a select menu for the options (multi-select
+supported), an ✏️ button that opens a modal for a free-text answer, and a
+cancel button. Picking an option updates the message in place and the agent's
+turn continues with the answer.
+
+How it works: the exclusive user-questions provider slot belongs to the web
+host, so the bridge joins as a *peer of the web client* instead — it consumes
+the host's own mux WebSocket (`/api/events.mux`) over loopback and settles
+answers through the same `POST /api/respond` the browser uses. Consequences:
+
+- A question shows up on **both** surfaces; whichever answers first wins, and
+  the other side sees it resolved (the Discord card updates itself).
+- Pending questions replay on reconnect, so a bridge or dsh restart loses
+  nothing.
+- `apiOrigin` config overrides the loopback origin when the host binds
+  somewhere unusual (default: `http://127.0.0.1:<webserver port>`).
+
 ## File transfer
 
 Both directions work, and the agent is told about them (a capability notice is

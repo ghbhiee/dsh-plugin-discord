@@ -55,13 +55,26 @@ export interface GatewayReady {
 export interface GatewayInteraction {
   id: string
   token: string
+  /** 2 = slash command, 3 = message component, 5 = modal submit. */
+  type?: number
   channel_id?: string
   guild_id?: string
   /** Present for guild invocations; the user rides inside. */
   member?: { user?: GatewayMessageAuthor }
   /** Present for DM invocations. */
   user?: GatewayMessageAuthor
-  data?: { name?: string; options?: { name: string; value?: unknown }[] }
+  /** The message whose component was used (component interactions). */
+  message?: { id: string }
+  data?: {
+    name?: string
+    options?: { name: string; value?: unknown }[]
+    /** Component/modal identity. */
+    custom_id?: string
+    /** Select-menu values. */
+    values?: string[]
+    /** Modal-submit rows. */
+    components?: unknown[]
+  }
 }
 
 interface GatewayPayload {

@@ -82,6 +82,7 @@ gateway.on('connection', (connection) => {
     } else if (payload.op === 6) {
       log('gateway: resume')
       connection.send(JSON.stringify({ op: 0, s: 2, t: 'RESUMED', d: {} }))
+      setTimeout(sendNextPrompt, 500)
     }
   })
 })
@@ -102,11 +103,54 @@ const rest = createServer((request, response) => {
       response.end()
       return
     }
+    if (url.includes('/interactions/') && request.method === 'POST') {
+      const body = JSON.parse(Buffer.concat(chunks).toString() || '{}')
+      log(`rest: interaction callback (type ${String(body.type)})${body.data?.content ? `: ${String(body.data.content).split('\n').pop()}` : ''}`)
+      response.writeHead(204)
+      response.end()
+      return
+    }
+    if (url.includes('/messages/') && request.method === 'PATCH') {
+      const body = JSON.parse(Buffer.concat(chunks).toString() || '{}')
+      log(`rest: message edited: ${String(body.content ?? '').split('\n').pop()}`)
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end('{}')
+      return
+    }
     if (url.includes('/messages') && request.method === 'POST') {
       const body = JSON.parse(Buffer.concat(chunks).toString())
+      const messageId = `fake-reply-${String(Date.now())}`
+      if (Array.isArray(body.components) && body.components.length > 0) {
+        // A question card: log it, then auto-click the first select option.
+        log(`<< QUESTION card:\n---\n${body.content}\n---`)
+        const select = body.components.flatMap(row => row.components ?? []).find(c => c.type === 3)
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ id: messageId }))
+        if (select !== undefined && socket !== undefined) {
+          const pick = select.options?.[0]
+          log(`>> auto-clicking select "${select.custom_id}" → option "${pick?.label ?? '?'}"`)
+          setTimeout(() => {
+            socket.send(JSON.stringify({
+              op: 0,
+              s: 900,
+              t: 'INTERACTION_CREATE',
+              d: {
+                id: `fake-itx-${String(Date.now())}`,
+                token: 'fake-itx-token',
+                type: 3,
+                channel_id: CHANNEL,
+                user: { id: USER_ID },
+                message: { id: messageId },
+                data: { custom_id: select.custom_id, component_type: 3, values: [pick?.value ?? '0'] },
+              },
+            }))
+          }, 800)
+        }
+        return
+      }
       log(`<< bridge replies:\n---\n${body.content}\n---`)
       response.writeHead(200, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ id: `fake-reply-${String(Date.now())}` }))
+      response.end(JSON.stringify({ id: messageId }))
       // A short debounce lets multi-chunk replies land before the next prompt.
       clearTimeout(globalThis.nextTimer)
       globalThis.nextTimer = setTimeout(() => {

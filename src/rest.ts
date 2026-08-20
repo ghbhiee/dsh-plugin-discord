@@ -78,6 +78,29 @@ export class DiscordRest {
     await this.request('POST', `/channels/${channelId}/typing`)
   }
 
+  /** Send one message carrying interactive components (selects/buttons). */
+  async createComponentMessage(channelId: string, content: string, components: readonly unknown[]): Promise<{ id: string }> {
+    return await this.request('POST', `/channels/${channelId}/messages`, {
+      content,
+      components,
+      allowed_mentions: { parse: [] },
+    }) as { id: string }
+  }
+
+  /** Edit one of the bot's own messages (content and/or components). */
+  async editMessage(channelId: string, messageId: string, content: string, components?: readonly unknown[]): Promise<void> {
+    await this.request('PATCH', `/channels/${channelId}/messages/${messageId}`, {
+      content,
+      ...components === undefined ? {} : { components },
+      allowed_mentions: { parse: [] },
+    })
+  }
+
+  /** Raw interaction callback (update-message, modal, …). */
+  async respondInteraction(interactionId: string, interactionToken: string, payload: unknown): Promise<void> {
+    await this.request('POST', `/interactions/${interactionId}/${interactionToken}/callback`, payload)
+  }
+
   /** Send one message carrying file attachments (multipart upload). */
   async createMessageWithFiles(
     channelId: string,

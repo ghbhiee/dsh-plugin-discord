@@ -22,6 +22,7 @@ import type { GatewayInteraction, GatewayMessage } from './gateway.ts'
 import { DiscordRest } from './rest.ts'
 import { APPLICATION_COMMANDS, commandFromInteraction, parseCommand } from './commands.ts'
 import { SessionBridge } from './bridge.ts'
+import { QuestionRelay } from './questions.ts'
 import { BindingStore } from './state.ts'
 import { loadHostModules } from './host-modules.ts'
 
@@ -67,6 +68,8 @@ export interface Config {
   gatewayUrl: string
   /** REST origin override; empty uses Discord. A test seam for a local fake API. */
   restBaseUrl: string
+  /** Loopback origin of this dsh host's own API; empty derives it from the web server's port. */
+  apiOrigin: string
 }
 
 /** Runtime schema for {@link Config}. */
@@ -88,6 +91,7 @@ export const Config: z<Config> = z.object({
   typingIntervalMs: z.number().default(8000),
   gatewayUrl: z.string().default(''),
   restBaseUrl: z.string().default(''),
+  apiOrigin: z.string().default(''),
 })
 
 interface LoggerLike {
@@ -172,6 +176,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.effect(() => {
     let disposed = false
     let gateway: DiscordGateway | undefined
+    let relay: QuestionRelay | undefined
     let rest: DiscordRest
     const store = new BindingStore(resolveStateFile(config.stateFile, ctx.baseUrl))
     let botUserId: string | undefined
@@ -193,6 +198,10 @@ export function apply(ctx: Context, config: Config): void {
     }
 
     const boot = (async () => {
+      // The whole plugin tree must finish mounting before the bridge serves:
+      // a message arriving seconds after process start would otherwise drive
+      // agents.create/presets against a half-mounted composition.
+      await (ctx.get('loader') as { await?: () => Promise<unknown> } | undefined)?.await?.()
       const token = await resolveToken(config)
       if (token === '') {
         logger.warn(`discord-bridge: no bot token (set config.token, the ${config.tokenEnv} environment variable, or config.tokenFile); bridge disabled`)
@@ -223,7 +232,10 @@ export function apply(ctx: Context, config: Config): void {
       const me = await rest.getMe()
       botUserId = me.id
       logger.info(`discord-bridge: authenticated as ${me.username} (${me.id})`)
-      if (disposed) return
+      if (disposed) {
+        logger.info('discord-bridge: boot abandoned (effect disposed mid-boot)')
+        return
+      }
 
       const onMessage = (message: GatewayMessage): void => {
         if (!isAllowed(message, botUserId, config.allowedUsers, config.allowedChannels)) return
@@ -268,9 +280,24 @@ export function apply(ctx: Context, config: Config): void {
         })
       }
 
+      relay = new QuestionRelay({
+        apiOrigin: config.apiOrigin !== ''
+          ? config.apiOrigin
+          : `http://127.0.0.1:${String((ctx.get('webServer') as { port?: number } | undefined)?.port ?? 3080)}`,
+        rest,
+        channelForSession: (sessionId) => {
+          for (const [channel, session] of store.entries()) {
+            if (session === sessionId) return channel
+          }
+          return undefined
+        },
+        log: (level, text) => { logger[level](`discord-bridge: ${text}`) },
+      })
+      if (!disposed) relay.start()
+      logger.info(`discord-bridge: question relay started (origin ${config.apiOrigin !== '' ? config.apiOrigin : 'auto'})`)
+
+      const questionRelay = relay
       const onInteraction = (interaction: GatewayInteraction): void => {
-        const commandName = interaction.data?.name
-        if (commandName === undefined) return
         const author = interaction.member?.user ?? interaction.user
         if (author === undefined) return
         const channelId = interaction.channel_id ?? ''
@@ -279,6 +306,16 @@ export function apply(ctx: Context, config: Config): void {
           channel_id: channelId,
           author,
         }
+        // Component clicks and modal submits route to the question relay.
+        if (interaction.type === 3 || interaction.type === 5) {
+          if (!isAllowed(admission, botUserId, config.allowedUsers, config.allowedChannels)) return
+          questionRelay.handleInteraction(interaction).catch((error: unknown) => {
+            logger.warn(`discord-bridge: component interaction failed: ${String(error)}`)
+          })
+          return
+        }
+        const commandName = interaction.data?.name
+        if (commandName === undefined) return
         void (async () => {
           if (!isAllowed(admission, botUserId, config.allowedUsers, config.allowedChannels)) {
             await rest.ackEphemeral(interaction.id, interaction.token, '未授权使用这个桥接。')
@@ -338,6 +375,7 @@ export function apply(ctx: Context, config: Config): void {
     return () => {
       disposed = true
       gateway?.stop()
+      relay?.stop()
       void store.flush()
     }
   }, 'discord bridge lifecycle')
