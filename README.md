@@ -25,6 +25,47 @@ appear in the `/` picker). Plain-text forms keep working as a fallback — typin
 
 Any other `/`-prefixed text passes through as a prompt.
 
+## Proactive notify: HTTP API + MCP (monitoring / reminders / alerts)
+
+Every deployment's bridge also serves its own bot as a **push channel**, so
+agents and daemons can message the user proactively instead of only replying.
+Registered under `/plugins/discord` on the dsh web server, guarded by a bearer
+secret (config `notifySecret` → env `DSH_DISCORD_NOTIFY_SECRET` → an
+auto-generated secret persisted as `discord-notify.secret` in the profile
+directory, mode 0600). Because each dsh serves its own bot, sender identity
+follows the deployment: dsh 本地 notifies as its bot, dsh 服务端 as its bot.
+
+**Plain HTTP** (daemons, cron, shell one-liners):
+
+```sh
+curl -s -X POST http://127.0.0.1:3080/plugins/discord/api/notify \
+  -H "authorization: Bearer $(cat ~/.dsh/profiles/web/discord-notify.secret)" \
+  -H 'content-type: application/json' \
+  -d '{"content": "⚠️ 磁盘使用率 92%"}'
+```
+
+`{"content", "userId"?, "channelId"?}` — default target is the first
+`allowedUsers` entry's DM. Long content is chunked automatically.
+
+**MCP** (Streamable HTTP at `POST /plugins/discord/mcp`, tool `discord_notify`) —
+give the dsh agent itself the tool via a machine-wide `~/.dsh/cordis.patch.yml` row:
+
+```yaml
+- insert:
+    - id: mcp-discord-notify
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: discord
+        transport: streamable-http
+        url: http://127.0.0.1:3080/plugins/discord/mcp
+        headers:
+          authorization: Bearer <secret>
+```
+
+Claude Code and other MCP clients connect the same way
+(`claude mcp add --transport http discord http://127.0.0.1:3080/plugins/discord/mcp --header "Authorization: Bearer <secret>"`).
+Set `notifyEnabled: false` to turn the whole surface off.
+
 ## Inline questions (ask_user_question → Discord components)
 
 When the agent asks the user a question (dsh's `ask_user_question` tool — option

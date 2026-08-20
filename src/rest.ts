@@ -119,6 +119,11 @@ export class DiscordRest {
     return await this.request('POST', `/channels/${channelId}/messages`, {}, form) as { id: string }
   }
 
+  /** Open (or fetch) the bot's DM channel with one user. */
+  async createDM(userId: string): Promise<{ id: string }> {
+    return await this.request('POST', '/users/@me/channels', { recipient_id: userId }) as { id: string }
+  }
+
   /** Replace the application's global slash commands (idempotent bulk overwrite). */
   async bulkOverwriteCommands(applicationId: string, commands: readonly unknown[]): Promise<void> {
     await this.request('PUT', `/applications/${applicationId}/commands`, commands)

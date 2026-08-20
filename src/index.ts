@@ -9,9 +9,10 @@
  * @module dsh-plugin-discord
  */
 
-import { readFile } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
@@ -22,6 +23,7 @@ import type { GatewayInteraction, GatewayMessage } from './gateway.ts'
 import { DiscordRest } from './rest.ts'
 import { APPLICATION_COMMANDS, commandFromInteraction, parseCommand } from './commands.ts'
 import { SessionBridge } from './bridge.ts'
+import { createNotifyHandler, DiscordNotifier } from './notify.ts'
 import { QuestionRelay } from './questions.ts'
 import { BindingStore } from './state.ts'
 import { loadHostModules } from './host-modules.ts'
@@ -70,6 +72,12 @@ export interface Config {
   restBaseUrl: string
   /** Loopback origin of this dsh host's own API; empty derives it from the web server's port. */
   apiOrigin: string
+  /** Enable the proactive-notify HTTP API + MCP endpoint under /plugins/discord. */
+  notifyEnabled: boolean
+  /** Bearer secret for the notify surface; empty falls back to `notifySecretEnv`, then an auto-generated persisted secret. */
+  notifySecret: string
+  /** Environment variable consulted when `notifySecret` is empty. */
+  notifySecretEnv: string
 }
 
 /** Runtime schema for {@link Config}. */
@@ -92,6 +100,9 @@ export const Config: z<Config> = z.object({
   gatewayUrl: z.string().default(''),
   restBaseUrl: z.string().default(''),
   apiOrigin: z.string().default(''),
+  notifyEnabled: z.boolean().default(true),
+  notifySecret: z.string().default(''),
+  notifySecretEnv: z.string().default('DSH_DISCORD_NOTIFY_SECRET'),
 })
 
 interface LoggerLike {
@@ -150,6 +161,32 @@ export async function resolveToken(config: Pick<Config, 'token' | 'tokenEnv' | '
   return ''
 }
 
+/**
+ * Resolve the notify bearer secret: config, then environment, then a
+ * generated secret persisted next to the binding state (0600), so the
+ * surface is usable out of the box and local callers can read the file.
+ * @returns the secret and where it came from.
+ */
+export async function resolveNotifySecret(
+  config: Pick<Config, 'notifySecret' | 'notifySecretEnv'>,
+  stateFile: string,
+): Promise<{ secret: string; source: string }> {
+  if (config.notifySecret.trim() !== '') return { secret: config.notifySecret.trim(), source: 'config' }
+  const fromEnv = (process.env[config.notifySecretEnv] ?? '').trim()
+  if (fromEnv !== '') return { secret: fromEnv, source: `env ${config.notifySecretEnv}` }
+  const file = join(dirname(stateFile), 'discord-notify.secret')
+  try {
+    const existing = (await readFile(file, 'utf8')).trim()
+    if (existing !== '') return { secret: existing, source: file }
+  } catch {
+    // Absent: generate below.
+  }
+  const generated = randomBytes(24).toString('hex')
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(file, `${generated}\n`, { mode: 0o600 })
+  return { secret: generated, source: `${file} (generated)` }
+}
+
 /** Message admission: bots never, DMs by user allowlist, guilds by channel (and user when listed). */
 export function isAllowed(
   message: Pick<GatewayMessage, 'guild_id' | 'channel_id'> & { author: { id: string; bot?: boolean } },
@@ -177,6 +214,7 @@ export function apply(ctx: Context, config: Config): void {
     let disposed = false
     let gateway: DiscordGateway | undefined
     let relay: QuestionRelay | undefined
+    let disposeNotify: (() => void) | undefined
     let rest: DiscordRest
     const store = new BindingStore(resolveStateFile(config.stateFile, ctx.baseUrl))
     let botUserId: string | undefined
@@ -235,6 +273,21 @@ export function apply(ctx: Context, config: Config): void {
       if (disposed) {
         logger.info('discord-bridge: boot abandoned (effect disposed mid-boot)')
         return
+      }
+
+      const webServer = ctx.get('webServer') as
+        | { register: (route: { kind: 'prefix'; path: string; handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => Promise<void> }) => () => void; port?: number }
+        | undefined
+      if (config.notifyEnabled && webServer !== undefined) {
+        const { secret, source } = await resolveNotifySecret(config, resolveStateFile(config.stateFile, ctx.baseUrl))
+        const notifier = new DiscordNotifier(rest, config.allowedUsers[0], config.maxChunksPerReply)
+        const handler = createNotifyHandler(
+          secret,
+          { notifier, botLabel: () => me.username, version: '0.5.0' },
+          (level, text) => { logger[level](`discord-bridge: ${text}`) },
+        )
+        disposeNotify = webServer.register({ kind: 'prefix', path: '/plugins/discord', handler })
+        logger.info(`discord-bridge: notify API + MCP at /plugins/discord (secret: ${source})`)
       }
 
       const onMessage = (message: GatewayMessage): void => {
@@ -376,6 +429,7 @@ export function apply(ctx: Context, config: Config): void {
       disposed = true
       gateway?.stop()
       relay?.stop()
+      disposeNotify?.()
       void store.flush()
     }
   }, 'discord bridge lifecycle')
