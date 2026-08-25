@@ -313,7 +313,7 @@ export class SessionBridge {
     if (this.noticed.has(agent)) return
     this.noticed.add(agent)
     agent.inject(this.host.createUserMessage({
-      content: [{ type: 'text', text: capabilityNotice(this.config.maxUploadBytes) }],
+      content: [{ type: 'text', text: capabilityNotice(this.config.maxUploadBytes, this.config.uploadRoots) }],
       source: { kind: 'plugin', plugin: 'dsh-plugin-discord', form: 'instructions' },
     }))
   }
