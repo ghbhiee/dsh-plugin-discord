@@ -61,9 +61,10 @@ describe('capabilityNotice', () => {
     expect(notice).toContain('.discord-uploads')
   })
 
-  it('teaches the containment rule and the copy-in workaround', () => {
+  it('teaches the containment rule, aiming tools at the cwd, and the copy-in fallback', () => {
     const bare = capabilityNotice(8_000_000)
     expect(bare).toContain('仅限会话工作目录')
+    expect(bare).toContain('输出目录参数')
     expect(bare).toContain('复制进会话工作目录')
     const withRoots = capabilityNotice(8_000_000, ['/Users/x/Downloads', '/tmp'])
     expect(withRoots).toContain('/Users/x/Downloads')
