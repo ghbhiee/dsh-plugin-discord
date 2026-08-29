@@ -1,16 +1,18 @@
 /**
  * Relay dsh `ask_user_question` prompts to Discord inline components.
  *
- * The bridge cannot register a second user-questions provider (the slot is
- * exclusive and the web host owns it), so it joins as a PEER of the web
- * client instead: it consumes the host's own mux stream over a loopback
- * WebSocket (`/api/events.mux`, the same upgrade the browser performs),
- * renders `question/requested` frames for Discord-bound sessions as select
- * menus / modals, and settles answers through the same `POST /api/respond`
- * the browser uses. Whichever surface answers first wins;
- * `question/resolved` frames keep the other surface in sync — the stream
- * replays still-pending questions on (re)connect, so a bridge restart loses
- * nothing.
+ * The harness dispatches questions on the Agent-scoped Cordis waterfall
+ * `user-questions/request`: a listener either returns an answer (claiming the
+ * request) or calls `next()` to delegate to the surfaces behind it — the
+ * browser among them. This bridge listens at the root, so it sees every
+ * agent's question; for a session bound to a Discord channel it posts select
+ * menus / modals AND delegates in parallel, so the same question is answerable
+ * from Discord or from the web UI, whichever the user reaches first.
+ *
+ * (Before dsh 0.1.1 the slot was a single exclusive provider owned by the web
+ * host, and this bridge had to join as a loopback peer of the browser over
+ * `/api/events.mux`. That transport is gone — the API now requires browser
+ * authentication — and the waterfall replaces it with an in-process seat.)
  *
  * @module dsh-plugin-discord/questions
  */
@@ -24,7 +26,35 @@ interface QuestionOption {
   description?: string
 }
 
-/** One question item from a `question/requested` frame. */
+/**
+ * The harness question waterfall, declared locally.
+ *
+ * The event exists on the running host (dsh >= 0.1.1) but not in the type
+ * packages this plugin builds against, and the payload is structural — so the
+ * seat is declared here rather than pinning a build to one harness release.
+ */
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    'user-questions/request'(
+      request: AskRequest,
+      next: () => Promise<AskAnswer>,
+    ): Promise<AskAnswer>
+  }
+}
+
+/** One pending question request as the waterfall carries it. */
+export interface AskRequest {
+  questions: QuestionItem[]
+  agent?: { id: string }
+  signal?: AbortSignal
+}
+
+/** The settled answer the waterfall returns. */
+export interface AskAnswer {
+  answers: AnswerItem[]
+}
+
+/** One question item from the request. */
 export interface QuestionItem {
   id: string
   question: string
@@ -34,8 +64,8 @@ export interface QuestionItem {
   multiSelect?: boolean
 }
 
-/** One answered item, as `POST /api/respond` expects it. */
-interface AnswerItem {
+/** One answered item, in the shape the harness answer carries. */
+export interface AnswerItem {
   id: string
   selected: string[]
   custom?: string
@@ -148,128 +178,109 @@ export function parseCustomId(customId: string): ParsedCustomId | undefined {
 }
 
 export interface QuestionRelayOptions {
-  /** Loopback origin of the dsh host, e.g. `http://127.0.0.1:3080`. */
-  apiOrigin: string
   rest: DiscordRest
   /** Reverse binding lookup: which Discord channel owns this session. */
   channelForSession: (sessionId: string) => string | undefined
   log: (level: 'info' | 'warn', text: string) => void
 }
 
+/** One pending ask, keyed by the id minted for its components. */
+interface AskWaiter {
+  resolve: (answer: AskAnswer) => void
+  reject: (error: Error) => void
+}
+
 /** The live relay; one per plugin instance. */
 export class QuestionRelay {
   private readonly options: QuestionRelayOptions
   private readonly pending = new Map<string, PendingRelay>()
-  private stopped = true
-  private ws: WebSocket | undefined
-  private reconnectTimer: ReturnType<typeof setTimeout> | undefined
-  private backoffMs = 1000
+  private readonly waiters = new Map<string, AskWaiter>()
+  private counter = 0
 
   constructor(options: QuestionRelayOptions) {
     this.options = options
   }
 
-  start(): void {
-    this.stopped = false
-    this.connect()
-  }
-
+  /** Discard every pending ask; the plugin is unloading. */
   stop(): void {
-    this.stopped = true
-    if (this.reconnectTimer !== undefined) clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = undefined
-    try { this.ws?.close(1000) } catch { /* closing */ }
-    this.ws = undefined
+    for (const [id, waiter] of this.waiters) {
+      this.waiters.delete(id)
+      this.pending.delete(id)
+      waiter.reject(new Error('discord bridge unloaded'))
+    }
   }
 
   /**
-   * Attach to the host's mux WebSocket (the same `/api/events.mux` upgrade the
-   * browser performs); pending questions replay on every (re)connect.
+   * One seat on the `user-questions/request` waterfall.
+   *
+   * A question for a session no session-bound channel owns is delegated
+   * untouched. Otherwise the cards go to Discord and the delegation runs
+   * alongside them, so the browser keeps its copy: the first surface to
+   * answer settles the ask, and a web answer visibly closes the Discord card.
+   * @param request - the pending question request.
+   * @param next - delegation to the surfaces behind this one.
+   * @returns the answer from whichever surface responded first.
    */
-  private connect(): void {
-    if (this.stopped) return
-    const url = `${this.options.apiOrigin.replace(/^http/, 'ws')}/api/events.mux`
-    let ws: WebSocket
-    try {
-      ws = new WebSocket(url)
-    } catch (error) {
-      this.options.log('warn', `mux socket open failed: ${String(error)}`)
-      this.scheduleReconnect()
-      return
-    }
-    this.ws = ws
-    ws.addEventListener('open', () => {
-      this.backoffMs = 1000
-      this.options.log('info', 'question relay attached to mux stream')
-    })
-    ws.addEventListener('message', (event) => {
-      if (typeof event.data === 'string') this.handleFrame(event.data)
-    })
-    ws.addEventListener('close', () => {
-      if (this.ws !== ws) return
-      this.ws = undefined
-      if (this.stopped) return
-      this.scheduleReconnect()
-    })
-    ws.addEventListener('error', () => { /* the paired close event reconnects */ })
-  }
+  async handleAsk(request: AskRequest, next: () => Promise<AskAnswer>): Promise<AskAnswer> {
+    const sessionId = request.agent?.id
+    const channelId = sessionId === undefined ? undefined : this.options.channelForSession(sessionId)
+    if (channelId === undefined || request.questions.length === 0) return await next()
 
-  private scheduleReconnect(): void {
-    if (this.stopped || this.reconnectTimer !== undefined) return
-    const delay = this.backoffMs
-    this.backoffMs = Math.min(this.backoffMs * 2, 30_000)
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined
-      this.connect()
-    }, delay)
-  }
-
-  private handleFrame(data: string): void {
-    let envelope: { rpcId?: string; payload?: { type?: string } }
-    try {
-      envelope = JSON.parse(data) as typeof envelope
-    } catch {
-      return
-    }
-    const payload = envelope.payload
-    if (payload?.type === 'question/requested' && envelope.rpcId !== undefined) {
-      const frame = payload as { sessionId: string; questions: QuestionItem[] }
-      void this.onRequested(envelope.rpcId, frame.sessionId, frame.questions)
-    } else if (payload?.type === 'question/resolved') {
-      const frame = payload as { sessionId: string; questionRpcId: string; outcome: string }
-      void this.onResolved(frame.questionRpcId, frame.outcome)
-    }
-  }
-
-  private async onRequested(rpcId: string, sessionId: string, questions: QuestionItem[]): Promise<void> {
-    if (this.pending.has(rpcId)) return // reconnect replay of a question we already posted
-    const channelId = this.options.channelForSession(sessionId)
-    if (channelId === undefined) return // not a Discord-bound session
+    this.counter += 1
+    const askId = `a${String(this.counter)}`
     const relay: PendingRelay = {
-      rpcId, sessionId, channelId, questions,
+      rpcId: askId,
+      sessionId: sessionId ?? '',
+      channelId,
+      questions: request.questions,
       answers: new Map(),
-      messageIds: questions.map(() => undefined),
+      messageIds: request.questions.map(() => undefined),
     }
-    this.pending.set(rpcId, relay)
+    this.pending.set(askId, relay)
+
+    const fromDiscord = new Promise<AskAnswer>((resolve, reject) => {
+      this.waiters.set(askId, { resolve, reject })
+    })
+    const onAbort = (): void => {
+      const waiter = this.waiters.get(askId)
+      if (waiter === undefined) return
+      this.waiters.delete(askId)
+      waiter.reject(new Error('question aborted'))
+    }
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+
     try {
-      for (const [index, item] of questions.entries()) {
+      for (const [index, item] of request.questions.entries()) {
         const message = await this.options.rest.createComponentMessage(
           channelId,
-          formatQuestionContent(item, index, questions.length),
-          buildComponents(rpcId, index, item),
+          formatQuestionContent(item, index, request.questions.length),
+          buildComponents(askId, index, item),
         )
         relay.messageIds[index] = message.id
       }
     } catch (error) {
-      this.options.log('warn', `question relay post failed: ${String(error)}`)
+      // Without a card there is nothing to answer from Discord: fall back to
+      // the surfaces behind us rather than stalling the turn.
+      this.options.log('warn', `question card post failed: ${String(error)}`)
+      this.cleanup(askId)
+      request.signal?.removeEventListener('abort', onAbort)
+      return await next()
+    }
+
+    const elsewhere = next().then(async (answer) => {
+      await this.closeCards(relay, '✅ 已回答(来自 web 界面)。')
+      return answer
+    })
+    try {
+      return await Promise.race([fromDiscord, elsewhere])
+    } finally {
+      this.cleanup(askId)
+      request.signal?.removeEventListener('abort', onAbort)
     }
   }
 
-  private async onResolved(rpcId: string, outcome: string): Promise<void> {
-    const relay = this.pending.get(rpcId)
-    if (relay === undefined) return
-    this.pending.delete(rpcId)
-    const note = outcome === 'answered' ? '✅ 已回答(可能来自 web 端)。' : '⏹️ 提问已取消。'
+  /** Strike through the posted cards once the ask is settled elsewhere. */
+  private async closeCards(relay: PendingRelay, note: string): Promise<void> {
     for (const [index, messageId] of relay.messageIds.entries()) {
       if (messageId === undefined) continue
       const item = relay.questions[index]
@@ -281,6 +292,11 @@ export class QuestionRelay {
         [],
       ).catch(() => { /* cosmetic */ })
     }
+  }
+
+  private cleanup(askId: string): void {
+    this.pending.delete(askId)
+    this.waiters.delete(askId)
   }
 
   /**
@@ -304,7 +320,7 @@ export class QuestionRelay {
     if (item === undefined) return true
 
     if (parsed.kind === 'cancel') {
-      await this.respondToHost(relay, undefined)
+      this.settle(parsed.rpcId, undefined)
       await this.options.rest.respondInteraction(interaction.id, interaction.token, {
         type: DISCORD.CALLBACK_UPDATE_MESSAGE,
         data: { content: `~~${formatQuestionContent(item, parsed.index, relay.questions.length).split('\n')[0] ?? ''}~~\n⏹️ 已取消。`, components: [] },
@@ -362,36 +378,27 @@ export class QuestionRelay {
     })
 
     if (relay.answers.size === relay.questions.length) {
-      await this.respondToHost(relay, [...relay.answers.entries()]
+      this.settle(parsed.rpcId, [...relay.answers.entries()]
         .sort(([a], [b]) => a - b)
         .map(([, value]) => value))
     }
     return true
   }
 
-  /** Settle the ask at the host: answers, or `undefined` to cancel it. */
-  private async respondToHost(relay: PendingRelay, answers: AnswerItem[] | undefined): Promise<void> {
-    const body = {
-      type: 'client-response',
-      rpcId: relay.rpcId,
-      result: answers === undefined
-        ? { ok: false, error: { code: 'cancelled', message: 'cancelled from Discord', details: {} } }
-        : { ok: true, value: { sessionId: relay.sessionId, answer: { answers } } },
+  /**
+   * Settle the waiting ask from Discord.
+   * @param askId - the id minted for this ask.
+   * @param answers - the collected answers, or undefined to cancel the ask.
+   */
+  private settle(askId: string, answers: AnswerItem[] | undefined): void {
+    const waiter = this.waiters.get(askId)
+    if (waiter === undefined) return
+    this.waiters.delete(askId)
+    this.pending.delete(askId)
+    if (answers === undefined) {
+      waiter.reject(new Error('the user cancelled the question from Discord'))
+      return
     }
-    try {
-      const response = await fetch(`${this.options.apiOrigin}/api/respond`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const receipt = await response.json().catch(() => ({})) as { accepted?: boolean; reason?: string }
-      if (receipt.accepted !== true) {
-        this.options.log('warn', `host rejected the answer: ${receipt.reason ?? String(response.status)}`)
-        await this.options.rest.createMessage(relay.channelId, `⚠️ 答案未被接受(${receipt.reason ?? 'unknown'}),可能已在 web 端处理。`).catch(() => { /* cosmetic */ })
-      }
-      // The question/resolved frame performs the cleanup on acceptance.
-    } catch (error) {
-      this.options.log('warn', `respond failed: ${String(error)}`)
-    }
+    waiter.resolve({ answers })
   }
 }

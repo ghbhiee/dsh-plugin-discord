@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildComponents, DISCORD, formatQuestionContent, parseCustomId } from '../src/questions.ts'
+import { buildComponents, DISCORD, formatQuestionContent, parseCustomId, QuestionRelay } from '../src/questions.ts'
 import type { QuestionItem } from '../src/questions.ts'
 
 const sample: QuestionItem = {
@@ -74,3 +74,97 @@ describe('parseCustomId', () => {
   })
 })
 
+
+describe('QuestionRelay.handleAsk (waterfall seat)', () => {
+  const restStub = (posted: unknown[], edits: unknown[]) => ({
+    createComponentMessage: async (channelId: string, content: string, components: unknown[]) => {
+      posted.push({ channelId, content, components })
+      return { id: `m${String(posted.length)}` }
+    },
+    editMessage: async (channelId: string, messageId: string, content: string) => {
+      edits.push({ channelId, messageId, content })
+    },
+    respondInteraction: async () => {},
+  })
+
+  const relayFor = (bound: string | undefined, posted: unknown[] = [], edits: unknown[] = []) =>
+    new QuestionRelay({
+      rest: restStub(posted, edits) as never,
+      channelForSession: () => bound,
+      log: () => {},
+    })
+
+  it('delegates untouched when the session owns no Discord channel', async () => {
+    const posted: unknown[] = []
+    const relay = relayFor(undefined, posted)
+    const answer = await relay.handleAsk(
+      { questions: [sample], agent: { id: 'session-x' } },
+      async () => ({ answers: [{ id: 'confirm-time', selected: ['今晚 23:40'] }] }),
+    )
+    expect(posted).toHaveLength(0)
+    expect(answer.answers[0]?.selected).toEqual(['今晚 23:40'])
+  })
+
+  it('posts a card for a bound session and settles from a Discord click', async () => {
+    const posted: { content: string; components: unknown[] }[] = []
+    const relay = relayFor('chan-1', posted as unknown[])
+    const pending = relay.handleAsk(
+      { questions: [sample], agent: { id: 'session-x' } },
+      () => new Promise(() => { /* web never answers */ }),
+    )
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(posted).toHaveLength(1)
+    expect(posted[0]?.content).toContain('11:40')
+
+    const row = (posted[0]?.components as { components: { custom_id: string }[] }[])[0]
+    const customId = row?.components[0]?.custom_id ?? ''
+    await relay.handleInteraction({
+      id: 'i1', token: 't', type: 3, channel_id: 'chan-1', user: { id: 'u1' },
+      data: { custom_id: customId, values: ['1'] },
+    } as never)
+    const answer = await pending
+    expect(answer.answers).toEqual([{ id: 'confirm-time', selected: ['明天上午 11:40'] }])
+  })
+
+  it('lets a web answer win and closes the Discord card', async () => {
+    const posted: unknown[] = []
+    const edits: { content: string }[] = []
+    const relay = relayFor('chan-1', posted, edits as unknown[])
+    const answer = await relay.handleAsk(
+      { questions: [sample], agent: { id: 'session-x' } },
+      async () => ({ answers: [{ id: 'confirm-time', selected: ['今晚 23:40'] }] }),
+    )
+    expect(answer.answers[0]?.selected).toEqual(['今晚 23:40'])
+    expect(edits[0]?.content).toContain('已回答')
+  })
+
+  it('falls back to delegation when the card cannot be posted', async () => {
+    const relay = new QuestionRelay({
+      rest: { createComponentMessage: async () => { throw new Error('discord down') } } as never,
+      channelForSession: () => 'chan-1',
+      log: () => {},
+    })
+    const answer = await relay.handleAsk(
+      { questions: [sample], agent: { id: 'session-x' } },
+      async () => ({ answers: [{ id: 'confirm-time', selected: ['今晚 23:40'] }] }),
+    )
+    expect(answer.answers[0]?.selected).toEqual(['今晚 23:40'])
+  })
+
+  it('rejects the ask when the user cancels from Discord', async () => {
+    const posted: { components: unknown[] }[] = []
+    const relay = relayFor('chan-1', posted as unknown[])
+    const pending = relay.handleAsk(
+      { questions: [sample], agent: { id: 'session-x' } },
+      () => new Promise(() => {}),
+    )
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const rows = posted[0]?.components as { components: { custom_id: string }[] }[]
+    const cancelId = rows[rows.length - 1]?.components.find(c => c.custom_id.startsWith('qx:'))?.custom_id ?? ''
+    await relay.handleInteraction({
+      id: 'i2', token: 't', type: 3, channel_id: 'chan-1', user: { id: 'u1' },
+      data: { custom_id: cancelId },
+    } as never)
+    await expect(pending).rejects.toThrow('cancel')
+  })
+})

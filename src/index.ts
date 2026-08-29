@@ -70,8 +70,6 @@ export interface Config {
   gatewayUrl: string
   /** REST origin override; empty uses Discord. A test seam for a local fake API. */
   restBaseUrl: string
-  /** Loopback origin of this dsh host's own API; empty derives it from the web server's port. */
-  apiOrigin: string
   /** Enable the proactive-notify HTTP API + MCP endpoint under /plugins/discord. */
   notifyEnabled: boolean
   /** Bearer secret for the notify surface; empty falls back to `notifySecretEnv`, then an auto-generated persisted secret. */
@@ -99,7 +97,6 @@ export const Config: z<Config> = z.object({
   typingIntervalMs: z.number().default(8000),
   gatewayUrl: z.string().default(''),
   restBaseUrl: z.string().default(''),
-  apiOrigin: z.string().default(''),
   notifyEnabled: z.boolean().default(true),
   notifySecret: z.string().default(''),
   notifySecretEnv: z.string().default('DSH_DISCORD_NOTIFY_SECRET'),
@@ -214,6 +211,7 @@ export function apply(ctx: Context, config: Config): void {
     let disposed = false
     let gateway: DiscordGateway | undefined
     let relay: QuestionRelay | undefined
+    let disposeQuestions: (() => void) | undefined
     let disposeNotify: (() => void) | undefined
     let rest: DiscordRest
     const store = new BindingStore(resolveStateFile(config.stateFile, ctx.baseUrl))
@@ -250,7 +248,7 @@ export function apply(ctx: Context, config: Config): void {
         ...config.restBaseUrl === '' ? {} : { baseUrl: config.restBaseUrl },
       })
       await store.load()
-      const host = await loadHostModules(ctx.baseUrl)
+      const host = await loadHostModules(ctx.baseUrl, (text) => { logger.warn(`discord-bridge: ${text}`) })
       const bridge = new SessionBridge({
         ctx,
         host,
@@ -360,9 +358,6 @@ export function apply(ctx: Context, config: Config): void {
       }
 
       relay = new QuestionRelay({
-        apiOrigin: config.apiOrigin !== ''
-          ? config.apiOrigin
-          : `http://127.0.0.1:${String((ctx.get('webServer') as { port?: number } | undefined)?.port ?? 3080)}`,
         rest,
         channelForSession: (sessionId) => {
           for (const [channel, session] of store.entries()) {
@@ -372,8 +367,20 @@ export function apply(ctx: Context, config: Config): void {
         },
         log: (level, text) => { logger[level](`discord-bridge: ${text}`) },
       })
-      if (!disposed) relay.start()
-      logger.info(`discord-bridge: question relay started (origin ${config.apiOrigin !== '' ? config.apiOrigin : 'auto'})`)
+      // One seat on the harness question waterfall: questions for
+      // Discord-bound sessions get cards, everything else is delegated.
+      const questionSeat = relay
+      // Prepended: the waterfall runs listeners in registration order, and the
+      // browser's answerer CLAIMS a question (it never delegates while a
+      // client is connected). Seating behind it would starve Discord of every
+      // question; seating in front lets this bridge post the card and hand the
+      // same question on with next(), so both surfaces stay live.
+      disposeQuestions = ctx.on(
+        'user-questions/request',
+        async (request, next) => await questionSeat.handleAsk(request, next),
+        { prepend: true },
+      )
+      logger.info('discord-bridge: question relay seated on user-questions/request')
 
       const questionRelay = relay
       const onInteraction = (interaction: GatewayInteraction): void => {
@@ -455,6 +462,7 @@ export function apply(ctx: Context, config: Config): void {
       disposed = true
       gateway?.stop()
       relay?.stop()
+      disposeQuestions?.()
       disposeNotify?.()
       void store.flush()
     }

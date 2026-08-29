@@ -17,8 +17,7 @@ import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-agent-presets'
-import type { SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
+import type { SessionId as SessionIdType, UserMessage } from '@deepseek-ai/dsh-session'
 import type { HostModules } from './host-modules.ts'
 import type { BridgeCommand } from './commands.ts'
 import { HELP_TEXT } from './commands.ts'
@@ -38,6 +37,23 @@ declare module '@deepseek-ai/dsh-llm' {
      */
     'user-discord': { kind: 'user'; discordMessageId: string; discordChannelId: string }
   }
+}
+
+/**
+ * Local stand-in for the harness message factory: the same shape it produces —
+ * a fresh identity, the user role, and a frozen body — so a host that no longer
+ * exports `createUserMessage` still gets a well-formed inbox message.
+ * @param content - message content blocks.
+ * @param source - the message source record.
+ * @returns a frozen user message.
+ */
+function localUserMessage(content: unknown[], source: Record<string, unknown>): UserMessage {
+  return Object.freeze({
+    id: randomUUID(),
+    role: 'user',
+    content: Object.freeze([...content]),
+    source: Object.freeze({ ...source }),
+  }) as unknown as UserMessage
 }
 
 /** Deployment knobs the bridge reads. */
@@ -138,7 +154,51 @@ export class SessionBridge {
   }
 
   private sessionId(id: string): SessionIdType {
-    return this.host.SessionId(id.startsWith('session-') ? id : `session-${id}`)
+    // SessionId() is a compile-time brand over the same string, so the cast
+    // needs no harness import and cannot drift with the host version.
+    return (id.startsWith('session-') ? id : `session-${id}`) as SessionIdType
+  }
+
+  /**
+   * Build the identified user message the inbox accepts.
+   *
+   * Prefers the host's own factory so identity and freezing follow whatever
+   * the running harness does; the local fallback keeps the bridge working on
+   * a host that no longer exports it.
+   * @param content - message content blocks.
+   * @param source - the message source, carrying the bridge's durable ids.
+   * @returns a frozen user message.
+   */
+  private userMessage(content: unknown[], source: Record<string, unknown>): UserMessage {
+    const factory = this.host.createUserMessage as
+      | ((input: { content: unknown[]; source: Record<string, unknown> }) => UserMessage)
+      | undefined
+    return factory === undefined ? localUserMessage(content, source) : factory({ content, source })
+  }
+
+  /**
+   * The preset a session actually RUNS, folded the way the host's `agentPreset`
+   * projection defines it: the creation header seeds it, and every
+   * `agent-preset/selected` event (a switch made while the session was blank)
+   * overrides it, last one winning.
+   *
+   * Folded here rather than imported: the harness moved this from an exported
+   * helper to a projection definition, and the fold itself is two lines.
+   * @param header - the session's creation header.
+   * @param events - the session's durable events.
+   * @returns the preset id to compose, or undefined for the deployment default.
+   */
+  private static resolvePreset(
+    header: { agentPreset?: string },
+    events: readonly { type: string; data?: unknown }[],
+  ): string | undefined {
+    let preset = header.agentPreset
+    for (const event of events) {
+      if (event.type !== 'agent-preset/selected') continue
+      const selected = (event.data as { agentPreset?: string } | undefined)?.agentPreset
+      if (typeof selected === 'string') preset = selected
+    }
+    return preset
   }
 
   private defaultSelection(): ModelSelection {
@@ -158,7 +218,9 @@ export class SessionBridge {
     if (agent === undefined) throw new Error('discord-bridge: agent setup has no scoped agent')
     let picked: ModelSelection | undefined
     const bridge = this
-    this.host.installModelSelection(agentCtx, {
+    const install = this.host.installModelSelection
+    if (install === undefined) return
+    install(agentCtx, {
       get current(): ModelSelection {
         if (picked !== undefined) return picked
         const logged = agent.session.requestHeader()?.config
@@ -210,9 +272,9 @@ export class SessionBridge {
       throw new Error(`failed to ensure session cwd "${this.config.cwd}": ${String(error)}`, { cause: error })
     }
     const composition = await this.composeSetup(this.config.preset === '' ? undefined : this.config.preset)
-    const id = `session-${randomUUID()}`
+    const id = this.sessionId(randomUUID())
     const handle = await this.ctx.agents.create({
-      sessionId: this.host.SessionId(id),
+      sessionId: id,
       meta: {
         cwd: this.config.cwd,
         ...composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset },
@@ -268,7 +330,7 @@ export class SessionBridge {
         const persistence = this.ctx.get('sessionPersistence')
         if (persistence === undefined) throw new Error('session persistence is unavailable')
         const inspected = await persistence.inspect(id)
-        const storedPreset = this.host.resolveSessionPreset({ header: inspected.meta, events: inspected.events })
+        const storedPreset = SessionBridge.resolvePreset(inspected.meta, inspected.events)
         const composition = await this.composeSetup(storedPreset)
         return (await this.ctx.agents.resume({
           resumeSessionId: id,
@@ -312,10 +374,10 @@ export class SessionBridge {
   private injectNoticeOnce(agent: Agent): void {
     if (this.noticed.has(agent)) return
     this.noticed.add(agent)
-    agent.inject(this.host.createUserMessage({
-      content: [{ type: 'text', text: capabilityNotice(this.config.maxUploadBytes, this.config.uploadRoots) }],
-      source: { kind: 'plugin', plugin: 'dsh-plugin-discord', form: 'instructions' },
-    }))
+    agent.inject(this.userMessage(
+      [{ type: 'text', text: capabilityNotice(this.config.maxUploadBytes, this.config.uploadRoots) }],
+      { kind: 'plugin', plugin: 'dsh-plugin-discord', form: 'instructions' },
+    ))
   }
 
   /** Save the user's Discord attachments under the session cwd; describe them for the prompt. */
@@ -406,10 +468,10 @@ export class SessionBridge {
         const notes = await this.saveIncoming(agentCwd, messageId, attachments)
         if (notes.length > 0) promptText = `${promptText}\n\n${notes.join('\n')}`.trim()
       }
-      agent.followup(this.host.createUserMessage({
-        content: [{ type: 'text', text: promptText }],
-        source: { kind: 'user', discordMessageId: messageId, discordChannelId: channelId },
-      }))
+      agent.followup(this.userMessage(
+        [{ type: 'text', text: promptText }],
+        { kind: 'user', discordMessageId: messageId, discordChannelId: channelId },
+      ))
       await agent.whenIdle()
       const flushable = this.ctx.get('sessions')
       if (flushable !== undefined) await flushable.flush(agent.session)
