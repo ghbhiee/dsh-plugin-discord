@@ -212,10 +212,17 @@ export class SessionBridge {
    * session driven from both surfaces converges on the same route. Reading
    * the logged request header (not a creation-time snapshot) means a model
    * switched in the web UI carries over to later Discord turns.
+   *
+   * The minted Agent arrives as setup's SECOND argument (dsh >= 0.1.5). Older
+   * hosts handed the same Agent to the setup context as a scoped `agent`
+   * property instead, so that form stays as a fallback and is probed lazily:
+   * a host that dropped the property throws on mere access.
+   * @param agentCtx - the Agent's scoped context.
+   * @param agent - the Agent being set up, when the host passes it.
    */
-  private installSelection(agentCtx: Context): void {
-    const agent = agentCtx.agent
-    if (agent === undefined) throw new Error('discord-bridge: agent setup has no scoped agent')
+  private installSelection(agentCtx: Context, agent?: Agent): void {
+    const scoped = agent ?? (agentCtx as Context & { agent?: Agent }).agent
+    if (scoped === undefined) throw new Error('discord-bridge: agent setup has no scoped agent')
     let picked: ModelSelection | undefined
     const bridge = this
     const install = this.host.installModelSelection
@@ -223,7 +230,7 @@ export class SessionBridge {
     install(agentCtx, {
       get current(): ModelSelection {
         if (picked !== undefined) return picked
-        const logged = agent.session.requestHeader()?.config
+        const logged = scoped.session.requestHeader()?.config
         if (logged === undefined) return bridge.defaultSelection()
         return {
           provider: logged.provider,
@@ -238,16 +245,22 @@ export class SessionBridge {
     })
   }
 
-  /** Compose the preset-mounting setup the web host uses for the same session. */
+  /**
+   * Compose the preset-mounting setup the web host uses for the same session.
+   *
+   * The callback is declared with an OPTIONAL Agent so it satisfies both host
+   * contracts at once: `(agentCtx, agent)` on dsh >= 0.1.5 and the older
+   * `(agentCtx)` form, where the Agent still comes off the scoped context.
+   */
   private async composeSetup(presetId: string | undefined): Promise<{
     agentPreset?: string
-    setup: (agentCtx: Context) => Promise<void>
+    setup: (agentCtx: Context, agent?: Agent) => Promise<void>
   }> {
     const presets = this.ctx.get('agentPresets')
     if (presets === undefined) {
       return {
-        setup: (agentCtx: Context) => {
-          this.installSelection(agentCtx)
+        setup: (agentCtx: Context, agent?: Agent) => {
+          this.installSelection(agentCtx, agent)
           return Promise.resolve()
         },
       }
@@ -255,8 +268,8 @@ export class SessionBridge {
     const resolvedId = (await presets.resolve(presetId)).id
     return {
       agentPreset: resolvedId,
-      setup: async (agentCtx: Context) => {
-        this.installSelection(agentCtx)
+      setup: async (agentCtx: Context, agent?: Agent) => {
+        this.installSelection(agentCtx, agent)
         await presets.mount(agentCtx, resolvedId)
       },
     }
@@ -315,6 +328,47 @@ export class SessionBridge {
   }
 
   /**
+   * Read the preset a stored session runs, for the resume composition.
+   *
+   * dsh <= 0.1.4 exposed whole-log reads as `sessionPersistence.inspect(id)`;
+   * dsh >= 0.1.5 deleted that method and reads a log through a per-session
+   * handle (`open` + `read`) over the same service. The handle form is tried
+   * first and the legacy form kept as the fallback, so the bridge resumes a
+   * bound session on either host instead of silently starting a new one.
+   * @param id - the stored session to read.
+   * @returns the recorded preset id, or undefined for the deployment default.
+   */
+  private async storedPreset(id: SessionIdType): Promise<string | undefined> {
+    const persistence = this.ctx.get('sessionPersistence') as
+      | {
+        open?: (sessionId: SessionIdType, access: 'read') => Promise<{
+          header: { agentPreset?: string }
+          read: (offset?: number, length?: number) => Promise<{ events: readonly { type: string; data?: unknown }[] }>
+          close: () => Promise<void>
+        }>
+        inspect?: (sessionId: SessionIdType) => Promise<{
+          meta: { agentPreset?: string }
+          events: readonly { type: string; data?: unknown }[]
+        }>
+      }
+      | undefined
+    if (persistence === undefined) throw new Error('session persistence is unavailable')
+    if (persistence.open !== undefined) {
+      const handle = await persistence.open(id, 'read')
+      try {
+        const { events } = await handle.read(0)
+        return SessionBridge.resolvePreset(handle.header, events)
+      } finally {
+        // The observation is complete; a release failure must not mask it.
+        await handle.close().catch(() => {})
+      }
+    }
+    if (persistence.inspect === undefined) throw new Error('session persistence exposes neither open() nor inspect()')
+    const inspected = await persistence.inspect(id)
+    return SessionBridge.resolvePreset(inspected.meta, inspected.events)
+  }
+
+  /**
    * Resolve one session id to a live agent, resuming it the way the web host
    * does: composed from the preset the log records.
    */
@@ -327,10 +381,7 @@ export class SessionBridge {
       acquisition = (async () => {
         const again = this.ctx.agents.get(id)
         if (again !== undefined) return again
-        const persistence = this.ctx.get('sessionPersistence')
-        if (persistence === undefined) throw new Error('session persistence is unavailable')
-        const inspected = await persistence.inspect(id)
-        const storedPreset = SessionBridge.resolvePreset(inspected.meta, inspected.events)
+        const storedPreset = await this.storedPreset(id)
         const composition = await this.composeSetup(storedPreset)
         return (await this.ctx.agents.resume({
           resumeSessionId: id,
@@ -476,7 +527,14 @@ export class SessionBridge {
       const flushable = this.ctx.get('sessions')
       if (flushable !== undefined) await flushable.flush(agent.session)
 
-      const events = agent.session.events as readonly { seq: number; type: string; data?: unknown }[]
+      // dsh >= 0.1.5 materializes the log through `snapshotEvents()`; earlier
+      // hosts exposed the same frozen array as a plain `events` property.
+      const log = agent.session as unknown as {
+        snapshotEvents?: () => readonly { seq: number; type: string; data?: unknown }[]
+        events?: readonly { seq: number; type: string; data?: unknown }[]
+      }
+      const events = log.snapshotEvents?.() ?? log.events
+      if (events === undefined) throw new Error('this host exposes no session event log (neither snapshotEvents() nor events)')
       const promptSeq = findPromptSeq(events, messageId)
       if (promptSeq === undefined) {
         return { chunks: [...preamble, '⚠️ 消息没有进入会话(可能被取消),请重试。'], files: [] }
@@ -515,7 +573,10 @@ export class SessionBridge {
     const persistence = this.ctx.get('sessionPersistence')
     if (persistence === undefined) return ['⚠️ 会话持久化服务不可用。']
     const bound = this.store.get(channelId)
-    const headers = (await persistence.list()) as readonly HeaderLike[]
+    // dsh >= 0.1.5 wraps each row in a storage snapshot (`{ header, revision }`);
+    // earlier hosts listed the header itself. Accept either.
+    const rows = (await persistence.list()) as readonly (HeaderLike | { header: HeaderLike })[]
+    const headers = rows.map(row => ('header' in row ? row.header : row))
     const boundIds = new Set(this.store.entries().map(([, session]) => session))
     const mine = headers
       .filter(header => boundIds.has(header.id))
