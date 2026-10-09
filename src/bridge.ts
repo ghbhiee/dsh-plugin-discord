@@ -36,8 +36,29 @@ declare module '@deepseek-ai/dsh-llm' {
      * web client uses with rpcId).
      */
     'user-discord': { kind: 'user'; discordMessageId: string; discordChannelId: string }
+    /**
+     * The bridge's own capability notice. A producer-owned kind, never the
+     * retired `{ kind: 'plugin', plugin }` wrapper — see {@link NOTICE_SOURCE}.
+     */
+    'discord-bridge': { kind: 'plugin:dsh-plugin-discord'; form: 'instructions' }
   }
 }
+
+/**
+ * The source every bridge-injected context message carries.
+ *
+ * dsh <= 0.1.6 accepted `{ kind: 'plugin', plugin }`; dsh >= 0.1.7 writes
+ * native format-v4 rows and refuses that wrapper outright — `format v4 message
+ * requires a producer-owned source kind`. The refusal happens while ENCODING
+ * the row for the log, so a turn died the moment it injected the notice, before
+ * it ever reached the model. The kind below is the one the harness's own v3→v4
+ * migration derives for a third-party producer, so a session resumed from an
+ * older log shows one producer identity instead of two.
+ */
+const NOTICE_SOURCE: Record<string, unknown> = Object.freeze({
+  kind: 'plugin:dsh-plugin-discord',
+  form: 'instructions',
+})
 
 /**
  * Local stand-in for the harness message factory: the same shape it produces —
@@ -427,7 +448,7 @@ export class SessionBridge {
     this.noticed.add(agent)
     agent.inject(this.userMessage(
       [{ type: 'text', text: capabilityNotice(this.config.maxUploadBytes, this.config.uploadRoots) }],
-      { kind: 'plugin', plugin: 'dsh-plugin-discord', form: 'instructions' },
+      NOTICE_SOURCE,
     ))
   }
 
