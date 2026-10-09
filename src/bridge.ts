@@ -93,6 +93,8 @@ export interface BridgeConfig {
   uploadRoots: string[]
   /** Cap on one incoming attachment saved to disk. */
   maxIncomingBytes: number
+  /** Capability notice override; absent uses the Discord notice. */
+  notice?: string
 }
 
 /** One reply: text chunks plus any files the agent asked to attach. */
@@ -447,7 +449,7 @@ export class SessionBridge {
     if (this.noticed.has(agent)) return
     this.noticed.add(agent)
     agent.inject(this.userMessage(
-      [{ type: 'text', text: capabilityNotice(this.config.maxUploadBytes, this.config.uploadRoots) }],
+      [{ type: 'text', text: this.config.notice ?? capabilityNotice(this.config.maxUploadBytes, this.config.uploadRoots) }],
       NOTICE_SOURCE,
     ))
   }

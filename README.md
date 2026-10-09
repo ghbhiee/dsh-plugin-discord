@@ -25,6 +25,29 @@ appear in the `/` picker). Plain-text forms keep working as a fallback — typin
 
 Any other `/`-prefixed text passes through as a prompt.
 
+## iMessage relay API
+
+The same session bridge also serves an external iMessage relay (for example
+[imessage-agent](https://github.com/ghbhiee/imessage-agent)), so iMessage
+conversations become ordinary web-visible sessions titled `[iMessage] 10-09 08:07`.
+The relay owns chat.db and AppleScript; the plugin only turns "channel + text"
+into a session turn, reusing the exact create/resume/prompt/command code the
+Discord side runs. Commands (`/new`, `/sessions`, `/use`, `/current`, `/stop`,
+`/help`) work the same way.
+
+Turns can run for minutes, so a prompt is accepted as a job and polled:
+
+| Endpoint | Body / query | Response |
+|---|---|---|
+| `POST /plugins/imessage/api/chat` | `{"channel": "<any stable id>", "text": "..."}` | `202 {"job": "<id>"}` |
+| `GET /plugins/imessage/api/job?id=<job>` | | `{"done": false}` or `{"done": true, "chunks": [...], "files": ["/tmp/..."]}` |
+
+Auth is the notify bearer secret (`<profile dir>/discord-notify.secret`).
+Attachments the agent marks with `[discord-file: /path]` come back as temp-file
+paths for the relay to send. Bindings live in `imessage-bridge-state.json` next
+to the Discord state. Config: `imessageEnabled` (default `true`),
+`imessageCwd` (default: `cwd`), `imessageTitlePrefix` (default `[iMessage] `).
+
 ## Proactive notify: HTTP API + MCP (monitoring / reminders / alerts)
 
 Every deployment's bridge also serves its own bot as a **push channel**, so

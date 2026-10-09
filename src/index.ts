@@ -24,6 +24,7 @@ import { DiscordRest } from './rest.ts'
 import { APPLICATION_COMMANDS, commandFromInteraction, parseCommand } from './commands.ts'
 import { SessionBridge } from './bridge.ts'
 import { createNotifyHandler, DiscordNotifier } from './notify.ts'
+import { createImessageHandler, imessageNotice } from './imessage.ts'
 import { QuestionRelay } from './questions.ts'
 import { BindingStore } from './state.ts'
 import { loadHostModules } from './host-modules.ts'
@@ -76,6 +77,12 @@ export interface Config {
   notifySecret: string
   /** Environment variable consulted when `notifySecret` is empty. */
   notifySecretEnv: string
+  /** Serve the iMessage relay API under /plugins/imessage (same bearer secret as notify). */
+  imessageEnabled: boolean
+  /** Working directory for iMessage sessions; empty uses `cwd`. */
+  imessageCwd: string
+  /** Title prefix marking a session as iMessage-originated. */
+  imessageTitlePrefix: string
 }
 
 /** Runtime schema for {@link Config}. */
@@ -100,6 +107,9 @@ export const Config: z<Config> = z.object({
   notifyEnabled: z.boolean().default(true),
   notifySecret: z.string().default(''),
   notifySecretEnv: z.string().default('DSH_DISCORD_NOTIFY_SECRET'),
+  imessageEnabled: z.boolean().default(true),
+  imessageCwd: z.string().default(''),
+  imessageTitlePrefix: z.string().default('[iMessage] '),
 })
 
 interface LoggerLike {
@@ -213,6 +223,8 @@ export function apply(ctx: Context, config: Config): void {
     let relay: QuestionRelay | undefined
     let disposeQuestions: (() => void) | undefined
     let disposeNotify: (() => void) | undefined
+    let disposeImessage: (() => void) | undefined
+    const imessageStore = new BindingStore(join(dirname(resolveStateFile(config.stateFile, ctx.baseUrl)), 'imessage-bridge-state.json'))
     let rest: DiscordRest
     const store = new BindingStore(resolveStateFile(config.stateFile, ctx.baseUrl))
     let botUserId: string | undefined
@@ -291,6 +303,35 @@ export function apply(ctx: Context, config: Config): void {
         )
         disposeNotify = webServer.register({ kind: 'prefix', path: '/plugins/discord', handler })
         logger.info(`discord-bridge: notify API + MCP at /plugins/discord (secret: ${source})`)
+      }
+
+      // iMessage relay: a second SessionBridge over the same host services, so
+      // iMessage conversations are ordinary web-visible sessions too.
+      if (config.imessageEnabled && webServer !== undefined) {
+        await imessageStore.load()
+        const imessageBridge = new SessionBridge({
+          ctx,
+          host,
+          store: imessageStore,
+          config: {
+            cwd: config.imessageCwd === '' ? config.cwd : config.imessageCwd,
+            preset: config.preset,
+            titlePrefix: config.imessageTitlePrefix,
+            maxChunksPerReply: config.maxChunksPerReply,
+            maxUploadBytes: config.maxUploadBytes,
+            uploadRoots: config.uploadRoots,
+            maxIncomingBytes: config.maxIncomingBytes,
+            notice: imessageNotice(config.uploadRoots),
+          },
+          log: (level, text) => { logger[level](`imessage-bridge: ${text}`) },
+        })
+        const { secret } = await resolveNotifySecret(config, resolveStateFile(config.stateFile, ctx.baseUrl))
+        disposeImessage = webServer.register({
+          kind: 'prefix',
+          path: '/plugins/imessage',
+          handler: createImessageHandler(imessageBridge, secret, (level, text) => { logger[level](`imessage-bridge: ${text}`) }),
+        })
+        logger.info('discord-bridge: iMessage relay API at /plugins/imessage')
       }
 
       // Identity check with retry: discord.com is flaky from some networks,
@@ -464,7 +505,9 @@ export function apply(ctx: Context, config: Config): void {
       relay?.stop()
       disposeQuestions?.()
       disposeNotify?.()
+      disposeImessage?.()
       void store.flush()
+      void imessageStore.flush()
     }
   }, 'discord bridge lifecycle')
 }
